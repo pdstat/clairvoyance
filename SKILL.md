@@ -36,6 +36,77 @@ Clairvoyance exploits these error messages by sending wordlist-based queries in 
 3. For each discovered field, probe its return type and arguments
 4. Find types that have no fields yet, build a document path from root, and repeat
 
+## Integration with gqlextractor
+
+Clairvoyance works best as part of a pipeline with `gqlextractor`. Run gqlextractor first to extract GraphQL field names from JavaScript bundles, then use those as a targeted wordlist for clairvoyance.
+
+### Shared Output Directory
+
+Both tools should share the same root output directory per target. The combined directory structure:
+
+```
+<output-dir>/
+  operations/          # gqlextractor: extracted .graphql operation files
+  requests/            # gqlextractor: JSON request bodies for replay
+  wordlist/
+    unique-fields.txt  # gqlextractor: unique field names (USE AS CLAIRVOYANCE WORDLIST)
+  field-paths/         # gqlextractor: field path analysis
+  schema/
+    schema.json        # clairvoyance: reconstructed schema (introspection format)
+    checkpoint.json    # clairvoyance: checkpoint file for resumable scans
+```
+
+### Recommended Workflow
+
+**Step 1 -- Run gqlextractor first** to extract field names from the target's JavaScript:
+```bash
+# Extract from JS files found via recon (waymore, xnlinkfinder, etc.)
+gqlextractor --input-urls=js_urls.txt --output-directory=./target-graphql --output-mode=all --search-field=id
+
+# Or from local JS bundles
+gqlextractor --input-directory=./js-files --output-directory=./target-graphql --output-mode=operations --output-mode=fields
+```
+
+**Step 2 -- Run clairvoyance** using gqlextractor's field wordlist:
+```bash
+python -m clairvoyance \
+  -w ./target-graphql/wordlist/unique-fields.txt \
+  --checkpoint ./target-graphql/schema/checkpoint.json \
+  -o ./target-graphql/schema/schema.json \
+  https://target.com/graphql
+```
+
+**Step 3 -- Feed schema back into gqlextractor** for field path analysis:
+```bash
+gqlextractor --input-schema=./target-graphql/schema/schema.json \
+  --search-field=password \
+  --output-directory=./target-graphql
+```
+
+### Why gqlextractor Should Run First
+
+- gqlextractor's `wordlist/unique-fields.txt` contains actual field names used by the target application, extracted from its own JavaScript bundles
+- This targeted wordlist is far more effective than generic wordlists -- fewer requests, higher hit rate, less chance of rate limiting
+- If gqlextractor hasn't been run yet, **suggest running it first** before clairvoyance
+- If no JS sources are available, fall back to generic wordlists (built-in, SecLists)
+
+### Detecting Existing gqlextractor Output
+
+Before running clairvoyance, check if the output directory already has gqlextractor results:
+```bash
+# Check for existing gqlextractor wordlist
+ls <output-dir>/wordlist/unique-fields.txt
+
+# Check for existing operations
+ls <output-dir>/operations/*.graphql
+```
+
+If `wordlist/unique-fields.txt` exists, always use it as the `-w` argument. You can combine it with the built-in wordlist for broader coverage:
+```bash
+cat <output-dir>/wordlist/unique-fields.txt <clairvoyance-install>/wordlist.txt | sort -u > /tmp/combined.txt
+python -m clairvoyance -w /tmp/combined.txt ...
+```
+
 ## Common Use Cases
 
 ### 1. Basic Schema Discovery
@@ -53,7 +124,28 @@ python -m clairvoyance -H "Authorization: Bearer TOKEN" -o schema.json https://t
 python -m clairvoyance -H "Authorization: Bearer TOKEN" -H "X-API-Key: KEY123" https://target.com/graphql
 ```
 
-### 2. Resumable Scans with Checkpoints
+### 2. Full Pipeline with gqlextractor (Preferred)
+```bash
+OUTPUT=./target-graphql
+mkdir -p "$OUTPUT/schema"
+
+# Phase 1: Extract fields from JS
+gqlextractor --input-urls=js_urls.txt --output-directory="$OUTPUT" --output-mode=fields --output-mode=operations
+
+# Phase 2: Blind introspection with extracted wordlist
+python -m clairvoyance \
+  -w "$OUTPUT/wordlist/unique-fields.txt" \
+  --checkpoint "$OUTPUT/schema/checkpoint.json" \
+  -o "$OUTPUT/schema/schema.json" \
+  -p slow \
+  https://target.com/graphql
+
+# Phase 3: Analyze discovered schema
+gqlextractor --input-schema="$OUTPUT/schema/schema.json" \
+  --search-field=email --output-directory="$OUTPUT"
+```
+
+### 3. Resumable Scans with Checkpoints
 Large schemas can take a long time. Use `--checkpoint` to save progress and resume if interrupted:
 ```bash
 # Start a scan with checkpointing (creates file if it doesn't exist)
@@ -71,7 +163,7 @@ The checkpoint file saves:
 
 **Note:** `--checkpoint` is mutually exclusive with `-i/--input-schema`.
 
-### 3. Speed Profiles
+### 4. Speed Profiles
 ```bash
 # Fast mode (default) - high concurrency, quick results
 python -m clairvoyance https://target.com/graphql
@@ -83,7 +175,7 @@ python -m clairvoyance -p slow https://target.com/graphql
 python -m clairvoyance -c 10 -m 20 -b 3 https://target.com/graphql
 ```
 
-### 4. Through a Proxy
+### 5. Through a Proxy
 ```bash
 # Route through Burp Suite or Caido
 python -m clairvoyance -x http://127.0.0.1:8080 https://target.com/graphql
@@ -92,7 +184,7 @@ python -m clairvoyance -x http://127.0.0.1:8080 https://target.com/graphql
 python -m clairvoyance -x http://127.0.0.1:8080 -k https://target.com/graphql
 ```
 
-### 5. Building on Partial Schema
+### 6. Building on Partial Schema
 ```bash
 # Start from an existing partial schema (e.g., from a previous run or manual discovery)
 python -m clairvoyance -i partial_schema.json -o full_schema.json https://target.com/graphql
@@ -142,25 +234,16 @@ Compatible with:
 - **GraphQL Voyager** -- visual schema explorer
 - **InQL** -- Burp Suite extension for GraphQL testing
 - **graphql-path-enum** -- find paths to specific types
+- **gqlextractor** -- feed schema back in for field path analysis
 
 ## Wordlist Strategy
 
-### Recommended Wordlists
-- **Built-in**: Clairvoyance ships with a default wordlist covering common GraphQL field names
-- **SecLists**: `SecLists/Discovery/Web-Content/graphql.txt`
-- **Custom**: Generate from JavaScript bundles, API docs, or source code
-
-### Building a Custom Wordlist
-```bash
-# Extract potential field names from JS bundles
-curl -s https://target.com/app.js | grep -oP '[a-zA-Z_][a-zA-Z0-9_]+' | sort -u > custom_wordlist.txt
-
-# Combine with default
-cat custom_wordlist.txt clairvoyance/wordlist.txt | sort -u > combined.txt
-
-# Validate wordlist (remove entries that don't match GraphQL name regex)
-python -m clairvoyance -w combined.txt -wv https://target.com/graphql
-```
+### Priority Order for Wordlists
+1. **gqlextractor output** (`<output-dir>/wordlist/unique-fields.txt`) -- best option, target-specific field names extracted from the application's own JavaScript
+2. **Combined wordlist** -- merge gqlextractor fields with clairvoyance's built-in wordlist for broader coverage
+3. **Built-in**: Clairvoyance ships with a default wordlist covering common GraphQL field names
+4. **SecLists**: `SecLists/Discovery/Web-Content/graphql.txt`
+5. **Manual extraction**: `grep -oP '[a-zA-Z_][a-zA-Z0-9_]+' app.js | sort -u`
 
 ### Wordlist Tips
 - GraphQL field names follow the regex `[_A-Za-z][_0-9A-Za-z]*`
@@ -205,7 +288,7 @@ cat schema.json | python -c "import json,sys; d=json.load(sys.stdin); [print(t['
 - Use verbose mode (`-v`) to see raw error messages
 
 ### Scan Takes Too Long
-- Use a smaller, targeted wordlist
+- Use a smaller, targeted wordlist (gqlextractor's `unique-fields.txt` is ideal)
 - Increase concurrency (`-c 20`)
 - Use `--checkpoint` so you can resume if interrupted
 - Check if the server is rate-limiting (switch to `-p slow`)
@@ -222,18 +305,26 @@ cat schema.json | python -c "import json,sys; d=json.load(sys.stdin); [print(t['
 - Corrupted checkpoint: delete the file and restart
 
 ## Notes for Claude
+
 When helping users with clairvoyance:
-1. Always suggest `--checkpoint` for large or long-running scans
-2. Recommend `-o schema.json` to save results to a file
-3. For authenticated targets, show the `-H` flag with proper header format
-4. Suggest `-p slow` when users report errors or rate limiting
-5. When analyzing discovered schemas, look for:
+
+### gqlextractor Integration (IMPORTANT)
+1. **Always check for existing gqlextractor output first.** Before running clairvoyance, look for `<output-dir>/wordlist/unique-fields.txt`. If it exists, use it as the `-w` argument.
+2. **If gqlextractor hasn't been run yet, suggest running it first.** The user should extract fields from JS bundles before running clairvoyance blind introspection. Only skip this if there are no JS sources available for the target.
+3. **Save clairvoyance output into the gqlextractor directory structure.** Schema goes in `<output-dir>/schema/schema.json`, checkpoint in `<output-dir>/schema/checkpoint.json`. Create the `schema/` subdirectory if needed.
+4. **After clairvoyance completes, suggest feeding the schema back into gqlextractor** for field path analysis (`--input-schema`).
+
+### General Guidance
+5. Always suggest `--checkpoint` for large or long-running scans
+6. Recommend `-o` pointing to the shared output directory's `schema/schema.json`
+7. For authenticated targets, show the `-H` flag with proper header format
+8. Suggest `-p slow` when users report errors or rate limiting
+9. When analyzing discovered schemas, look for:
    - Mutations that modify sensitive data (admin operations, password resets)
    - Types with names suggesting internal/debug functionality
    - Fields that accept user IDs or tokens (IDOR candidates)
    - Input types that might be vulnerable to injection
-6. Recommend custom wordlists built from the target's JS bundles or API docs
-7. Suggest GraphQL Voyager for visual exploration of discovered schemas
-8. For pentesting reports, document: target URL, wordlist used, types/fields discovered, and any sensitive operations found
-9. The `--checkpoint` flag is mutually exclusive with `-i/--input-schema`
-10. The default wordlist is built into the package at `clairvoyance/wordlist.txt`
+10. Suggest GraphQL Voyager for visual exploration of discovered schemas
+11. For pentesting reports, document: target URL, wordlist used, types/fields discovered, and any sensitive operations found
+12. The `--checkpoint` flag is mutually exclusive with `-i/--input-schema`
+13. The default wordlist is built into the package at `clairvoyance/wordlist.txt`
