@@ -136,9 +136,18 @@ def parse_args(args: List[str]) -> argparse.Namespace:
         action="store_true",
         help="Enable progress bar",
     )
+    parser.add_argument(
+        "--checkpoint",
+        metavar="<file>",
+        help="Checkpoint file for resumable scans. Resumes if file exists, otherwise starts fresh.",
+    )
     parser.add_argument("url")
 
     parsed_args = parser.parse_args(args)
+
+    if parsed_args.checkpoint and parsed_args.input_schema:
+        parser.error("--checkpoint and -i/--input-schema are mutually exclusive")
+
     if parsed_args.profile == "slow":
         set_slow_config(parsed_args)
 

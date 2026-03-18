@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from clairvoyance import graphql, oracle
+from clairvoyance.checkpoint import load_checkpoint, save_checkpoint
 from clairvoyance.client import Client
 from clairvoyance.config import Config
 from clairvoyance.entities import GraphQLPrimitive
@@ -58,6 +59,7 @@ async def blind_introspection(  # pylint: disable=too-many-arguments
     max_retries: Optional[int] = None,
     backoff: Optional[int] = None,
     disable_ssl_verify: Optional[bool] = None,
+    checkpoint_path: Optional[str] = None,
 ) -> str:
     wordlist = wordlist or load_default_wordlist()
     assert wordlist, "No wordlist provided"
@@ -76,13 +78,34 @@ async def blind_introspection(  # pylint: disable=too-many-arguments
     logger.info(f"Starting blind introspection on {url}...")
 
     input_schema = None
-    if input_schema_path:
+    ignored = set(e.value for e in GraphQLPrimitive)
+    iterations = 1
+
+    if checkpoint_path and Path(checkpoint_path).exists():
+        state = load_checkpoint(checkpoint_path)
+        if state.url != url:
+            logger.warning(
+                f"Checkpoint URL ({state.url}) differs from provided URL ({url})"
+            )
+        input_schema = state.schema
+        ignored = state.ignored
+        iterations = state.iteration
+        s = graphql.Schema(schema=input_schema)
+        _next = s.get_type_without_fields(ignored)
+        if _next:
+            ignored.add(_next)
+            input_document = s.convert_path_to_document(s.get_path_from_root(_next))
+        else:
+            logger.info("Checkpoint already complete, nothing to resume.")
+            await client().close()
+            return json.dumps(input_schema)
+        logger.info(f"Resumed from checkpoint at iteration {iterations}")
+    elif input_schema_path:
         with open(input_schema_path, "r", encoding="utf-8") as f:
             input_schema = json.load(f)
 
     input_document = input_document or "query { FUZZ }"
-    ignored = set(e.value for e in GraphQLPrimitive)
-    iterations = 1
+
     while True:
         logger.info(f"Iteration {iterations}")
         iterations += 1
@@ -106,6 +129,16 @@ async def blind_introspection(  # pylint: disable=too-many-arguments
             input_document = s.convert_path_to_document(s.get_path_from_root(_next))
         else:
             break
+
+        if checkpoint_path:
+            save_checkpoint(
+                checkpoint_path,
+                schema=input_schema,
+                ignored=ignored,
+                input_document=input_document,
+                iteration=iterations,
+                url=url,
+            )
 
     logger.info("Blind introspection complete.")
     await client().close()
@@ -155,5 +188,6 @@ def cli(argv: Optional[List[str]] = None) -> None:
             max_retries=args.max_retries,
             backoff=args.backoff,
             disable_ssl_verify=args.no_ssl,
+            checkpoint_path=args.checkpoint,
         )
     )
