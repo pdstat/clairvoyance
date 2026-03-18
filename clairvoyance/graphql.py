@@ -374,15 +374,14 @@ class Type:
         self.fields: List[Field] = fields or []
 
     def to_json(self) -> Dict[str, Any]:
-        # dirty hack
-
-        if not self.fields:
+        fields_for_json = self.fields
+        if not fields_for_json:
             field_typeref = TypeRef(
                 name=GraphQLPrimitive.STRING,
                 kind=GraphQLKind.SCALAR,
             )
             dummy = Field("dummy", field_typeref)
-            self.fields.append(dummy)
+            fields_for_json = [dummy]
 
         output: Dict[str, Any] = {
             "description": None,
@@ -394,11 +393,11 @@ class Type:
         }
 
         if self.kind in [GraphQLKind.OBJECT, GraphQLKind.INTERFACE]:
-            output["fields"] = [f.to_json() for f in self.fields]
+            output["fields"] = [f.to_json() for f in fields_for_json]
             output["inputFields"] = None
         elif self.kind == GraphQLKind.INPUT_OBJECT:
             output["fields"] = None
-            output["inputFields"] = [f.to_json() for f in self.fields]
+            output["inputFields"] = [f.to_json() for f in fields_for_json]
 
         return output
 

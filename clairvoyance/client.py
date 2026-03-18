@@ -24,10 +24,12 @@ class Client(IClient):  # pylint: disable=too-many-instance-attributes
 
         self._headers = headers or {}
         self._max_retries = max_retries or 3
+        self._timeout = aiohttp.ClientTimeout(total=60)
         self._semaphore = asyncio.Semaphore(concurrent_requests or 50)
         self.proxy = proxy
         self.backoff = backoff
         self._backoff_semaphore = asyncio.Lock()
+        self._session_lock = asyncio.Lock()
         self.disable_ssl_verify = disable_ssl_verify or False
 
         client_ctx.set(self)
@@ -40,14 +42,17 @@ class Client(IClient):  # pylint: disable=too-many-instance-attributes
         """Post a GraphQL document to the server and return the response as JSON."""
 
         if retries >= self._max_retries:
-            return {}
+            log().warning(f"Max retries ({self._max_retries}) exceeded for {self._url}")
+            return {"errors": []}
 
         async with self._semaphore:
             if not self._session:
-                connector = aiohttp.TCPConnector(ssl=not self.disable_ssl_verify)
-                self._session = aiohttp.ClientSession(
-                    headers=self._headers, connector=connector
-                )
+                async with self._session_lock:
+                    if not self._session:
+                        connector = aiohttp.TCPConnector(ssl=not self.disable_ssl_verify)
+                        self._session = aiohttp.ClientSession(
+                            headers=self._headers, connector=connector
+                        )
 
             # Translate an existing document into a GraphQL request.
             gql_document = {"query": document} if document else None
@@ -56,6 +61,7 @@ class Client(IClient):  # pylint: disable=too-many-instance-attributes
                     self._url,
                     json=gql_document,
                     proxy=self.proxy,
+                    timeout=self._timeout,
                 )
 
                 if response.status >= 500:

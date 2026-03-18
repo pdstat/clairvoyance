@@ -90,7 +90,7 @@ _GENERAL_SKIP = [
     r"""String cannot represent a non string value: .+""",
     r"""Float cannot represent a non numeric value: .+""",
     r"""ID cannot represent a non-string and non-integer value: .+""",
-    r"""Enum ['"]""" + MAIN_REGEX + r"""['"] cannot represent non-enum value: .+"""
+    r"""Enum ['"]""" + MAIN_REGEX + r"""['"] cannot represent non-enum value: .+""",
     r"""Int cannot represent non-integer value: .+""",
     r"""Not authorized""",
 ]
@@ -175,13 +175,18 @@ async def probe_valid_fields(
         response = await client().post(document)
         total_time = time.time() - start_time
 
-        errors = response["errors"]
+        errors = response.get("errors", [])
+        if not errors:
+            return set()
 
         log().debug(
             f"Sent {len(bucket)} fields, received {len(errors)} errors in {round(total_time, 2)} seconds"
         )
 
         for error in errors:
+            if isinstance(error, str) or not isinstance(error.get("message"), str):
+                continue
+
             error_message = error["message"]
 
             if (
@@ -242,6 +247,9 @@ async def probe_valid_args(
 
     errors = response["errors"]
     for error in errors:
+        if isinstance(error, str) or not isinstance(error.get("message"), str):
+            continue
+
         error_message = error["message"]
 
         if (
@@ -303,10 +311,9 @@ def get_valid_args(error_message: str) -> Set[str]:
             return set()
 
     for regex in ARG_REGEXES["SINGLE_SUGGESTION"]:
-        if re.fullmatch(regex, error_message):
-            match = re.fullmatch(regex, error_message)
-            if match:
-                valid_args.add(match.group("arg"))
+        match = re.fullmatch(regex, error_message)
+        if match:
+            valid_args.add(match.group("arg"))
 
     for regex in ARG_REGEXES["DOUBLE_SUGGESTION"]:
         match = re.fullmatch(regex, error_message)
@@ -315,15 +322,14 @@ def get_valid_args(error_message: str) -> Set[str]:
             valid_args.add(match.group("second"))
 
     for regex in ARG_REGEXES["MULTI_SUGGESTION"]:
-        if re.fullmatch(regex, error_message):
-            match = re.fullmatch(regex, error_message)
-            if match:
-                for m in match.group("multi").split(", "):
-                    if m:
-                        valid_args.add(m.strip("'\" "))
+        match = re.fullmatch(regex, error_message)
+        if match:
+            for m in match.group("multi").split(", "):
+                if m:
+                    valid_args.add(m.strip("'\" "))
 
-                if match.group("last"):
-                    valid_args.add(match.group("last"))
+            if match.group("last"):
+                valid_args.add(match.group("last"))
 
     if not valid_args:
         log().debug(f"Unknown error message for `valid_args`: '{error_message}'")
@@ -416,14 +422,13 @@ async def probe_typeref(
 
         response = await client().post(document)
         for error in response.get("errors", []):
-            if isinstance(error, str):
+            if isinstance(error, str) or not isinstance(error.get("message"), str):
                 continue
 
-            if not isinstance(error["message"], dict):
-                typeref = get_typeref(
-                    error["message"],
-                    context,
-                )
+            typeref = get_typeref(
+                error["message"],
+                context,
+            )
             log().debug(f'get_typeref("{error["message"]}", "{context}") -> {typeref}')
             if typeref:
                 return typeref
@@ -497,6 +502,8 @@ async def probe_typename(input_document: str) -> str:
     match = None
     for regex in WRONG_TYPENAME:
         for error in errors:
+            if isinstance(error, str) or not isinstance(error.get("message"), str):
+                continue
             match = re.fullmatch(regex, error["message"])
             if match:
                 break
@@ -530,8 +537,8 @@ async def fetch_root_typenames() -> Dict[str, Optional[str]]:
     ):
         response = await client().post(document=document)
 
-        data = response.get("data", {})
-        if data:
+        data = response.get("data") or {}
+        if "__typename" in data:
             typenames[name] = data["__typename"]
 
     log().debug(f"Root typenames are: {typenames}")
@@ -629,6 +636,6 @@ async def clairvoyance(
         for arg in args:
             schema.add_type(arg.type.name, "INPUT_OBJECT")
         schema.types[typename].fields.append(field)
-        schema.add_type(field.type.name, "OBJECT")
+        schema.add_type(field.type.name, field.type.kind)
 
     return repr(schema)
