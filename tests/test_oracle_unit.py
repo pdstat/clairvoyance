@@ -1,5 +1,6 @@
 """Broader unit test coverage for oracle.py functions."""
 
+import logging
 import unittest
 
 import aiounittest
@@ -23,6 +24,7 @@ class TestGetValidFieldsEdgeCases(unittest.TestCase):
         self.assertEqual(got, {"users"})
 
     def test_unknown_message_returns_empty(self) -> None:
+        setup_test_context()
         got = oracle.get_valid_fields("This is totally unexpected gibberish.")
         self.assertEqual(got, set())
 
@@ -99,6 +101,7 @@ class TestGetValidArgsEdgeCases(unittest.TestCase):
         self.assertEqual(got, set())
 
     def test_unknown_message_returns_empty(self) -> None:
+        setup_test_context()
         got = oracle.get_valid_args("Totally unexpected message here.")
         self.assertEqual(got, set())
 
@@ -249,6 +252,166 @@ class TestProbeTypename(aiounittest.AsyncTestCase):
         ])
         result = await oracle.probe_typename("query { FUZZ }")
         self.assertEqual(result, "Query")
+
+
+class TestNormalizeErrorMessage(unittest.TestCase):
+    def test_strips_redacted_suffix(self) -> None:
+        raw = 'Cannot query field "x" on type "Query". Did you mean "y"? <[REDACTED]>'
+        got = oracle.normalize_error_message(raw)
+        self.assertEqual(got, 'Cannot query field "x" on type "Query". Did you mean "y"?')
+
+    def test_strips_filtered_suffix(self) -> None:
+        raw = 'Field "x" of type "Y" must have a selection of subfields. [FILTERED]'
+        got = oracle.normalize_error_message(raw)
+        self.assertEqual(got, 'Field "x" of type "Y" must have a selection of subfields.')
+
+    def test_strips_removed_suffix(self) -> None:
+        raw = 'Cannot query field "x" on type "Query". [REMOVED]'
+        got = oracle.normalize_error_message(raw)
+        self.assertEqual(got, 'Cannot query field "x" on type "Query".')
+
+    def test_preserves_clean_message(self) -> None:
+        raw = 'Cannot query field "x" on type "Query". Did you mean "y"?'
+        got = oracle.normalize_error_message(raw)
+        self.assertEqual(got, raw)
+
+    def test_strips_with_extra_whitespace(self) -> None:
+        raw = 'Field "x" of type "Y" must have a selection of subfields.   <[REDACTED]>'
+        got = oracle.normalize_error_message(raw)
+        self.assertEqual(got, 'Field "x" of type "Y" must have a selection of subfields.')
+
+    def test_empty_string(self) -> None:
+        self.assertEqual(oracle.normalize_error_message(""), "")
+
+    def test_only_suffix(self) -> None:
+        self.assertEqual(oracle.normalize_error_message("<[REDACTED]>"), "")
+
+
+class TestRedactedSuffixIntegration(unittest.TestCase):
+    """Verify that sanitized error messages still produce correct results."""
+
+    def test_get_valid_fields_with_redacted_suffix_unnormalized(self) -> None:
+        """Without normalization, fullmatch fails on redacted suffix."""
+        setup_test_context()
+        got = oracle.get_valid_fields(
+            'Cannot query field "x" on type "Query". Did you mean "users"? <[REDACTED]>'
+        )
+        self.assertEqual(got, set())
+
+    def test_get_valid_fields_with_redacted_suffix_normalized(self) -> None:
+        """With normalization applied, the suggestion is extracted."""
+        msg = oracle.normalize_error_message(
+            'Cannot query field "x" on type "Query". Did you mean "users"? <[REDACTED]>'
+        )
+        got = oracle.get_valid_fields(msg)
+        self.assertEqual(got, {"users"})
+
+    def test_get_valid_fields_subfields_without_suggestion(self) -> None:
+        got = oracle.get_valid_fields(
+            'Field "items" of type "Item" must have a selection of subfields.'
+        )
+        self.assertEqual(got, {"items"})
+
+    def test_get_typeref_subfields_without_suggestion(self) -> None:
+        got = oracle.get_typeref(
+            'Field "items" of type "Item" must have a selection of subfields.',
+            FuzzingContext.FIELD,
+        )
+        self.assertIsNotNone(got)
+        self.assertEqual(got.name, "Item")
+        self.assertEqual(got.kind, "OBJECT")
+
+
+class TestPerFieldProgressLogging(aiounittest.AsyncTestCase):
+    """Verify per-field INFO logging and phase announcements."""
+
+    async def test_clairvoyance_logs_phase_and_progress(self) -> None:
+        subfield_msg = 'Field "users" of type "User" must have a selection of subfields. Did you mean "users { ... }"?'
+        setup_test_context(
+            responses=[
+                # fetch_root_typenames: 3 calls
+                {"data": {"__typename": "Query"}},
+                {"errors": [{"message": "no mutation"}]},
+                {"errors": [{"message": "no subscription"}]},
+                # probe_typename
+                {"errors": [{"message": 'Cannot query field "IAmWrongField" on type "Query".'}]},
+                # probe_valid_fields (1 bucket with 1 word)
+                {"errors": [{"message": subfield_msg}]},
+                # probe_field_type sends 2 documents concurrently
+                {"errors": [{"message": subfield_msg}]},
+                {"errors": [{"message": subfield_msg}]},
+                # probe_args sends 1 bucket (wordlist reused)
+                {"errors": [{"message": 'Unknown argument "users" on field "users" of type "Query".'}]},
+            ],
+            bucket_size=64,
+        )
+        logger = logging.getLogger("clairvoyance.test")
+        with self.assertLogs(logger, level="INFO") as cm:
+            await oracle.clairvoyance(
+                wordlist=["users"],
+                input_document="query { FUZZ }",
+            )
+
+        log_text = "\n".join(cm.output)
+        self.assertIn("Probing 1 fields on Query", log_text)
+        self.assertIn("[1/1] Query.users: type=User (OBJECT), args=0", log_text)
+
+
+class TestRedactedSuffixAsync(aiounittest.AsyncTestCase):
+    """Verify normalization works in async probe functions."""
+
+    async def test_probe_valid_fields_redacted(self) -> None:
+        setup_test_context(
+            responses=[{"errors": [
+                {"message": 'Cannot query field "x" on type "Query". Did you mean "users"? <[REDACTED]>'},
+            ]}],
+            bucket_size=64,
+        )
+        result = await oracle.probe_valid_fields(["x"], "query { FUZZ }")
+        self.assertIn("users", result)
+
+    async def test_probe_valid_fields_filtered(self) -> None:
+        setup_test_context(
+            responses=[{"errors": [
+                {"message": 'Cannot query field "x" on type "Query". Did you mean "users"? [FILTERED]'},
+            ]}],
+            bucket_size=64,
+        )
+        result = await oracle.probe_valid_fields(["x"], "query { FUZZ }")
+        self.assertIn("users", result)
+
+    async def test_probe_valid_args_redacted(self) -> None:
+        setup_test_context(responses=[{"errors": [
+            {"message": 'Unknown argument "x" on field "users" of type "Query". Did you mean "limit"? <[REDACTED]>'},
+        ]}])
+        result = await oracle.probe_valid_args("users", ["x"], "query { FUZZ }")
+        self.assertIn("limit", result)
+
+    async def test_probe_typename_redacted(self) -> None:
+        setup_test_context(responses=[{"errors": [
+            {"message": 'Cannot query field "IAmWrongField" on type "CustomQuery". <[REDACTED]>'},
+        ]}])
+        result = await oracle.probe_typename("query { FUZZ }")
+        self.assertEqual(result, "CustomQuery")
+
+    async def test_probe_typename_filtered(self) -> None:
+        setup_test_context(responses=[{"errors": [
+            {"message": 'Cannot query field "IAmWrongField" on type "RootQuery". [FILTERED]'},
+        ]}])
+        result = await oracle.probe_typename("query { FUZZ }")
+        self.assertEqual(result, "RootQuery")
+
+    async def test_probe_typeref_redacted(self) -> None:
+        setup_test_context(responses=[{"errors": [
+            {"message": 'Field "items" of type "Item" must have a selection of subfields. <[REDACTED]>'},
+        ]}])
+        result = await oracle.probe_typeref(
+            ["query { items }"],
+            FuzzingContext.FIELD,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.name, "Item")
+        self.assertEqual(result.kind, "OBJECT")
 
 
 if __name__ == "__main__":

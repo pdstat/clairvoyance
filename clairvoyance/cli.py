@@ -12,6 +12,7 @@ from clairvoyance.client import Client
 from clairvoyance.config import Config
 from clairvoyance.entities import GraphQLPrimitive
 from clairvoyance.entities.context import client, logger_ctx
+from clairvoyance.entities.errors import AuthError
 from clairvoyance.utils import parse_args, setup_logger
 
 
@@ -24,6 +25,8 @@ def setup_context(
     max_retries: Optional[int] = None,
     backoff: Optional[int] = None,
     disable_ssl_verify: Optional[bool] = None,
+    rate_limit: Optional[float] = None,
+    disable_cookies: bool = False,
 ) -> None:
     """Initialize objects and freeze them into the context."""
 
@@ -36,6 +39,8 @@ def setup_context(
         max_retries=max_retries,
         backoff=backoff,
         disable_ssl_verify=disable_ssl_verify,
+        rate_limit=rate_limit,
+        disable_cookies=disable_cookies,
     )
     logger_ctx.set(logger)
 
@@ -60,6 +65,8 @@ async def blind_introspection(  # pylint: disable=too-many-arguments
     backoff: Optional[int] = None,
     disable_ssl_verify: Optional[bool] = None,
     checkpoint_path: Optional[str] = None,
+    rate_limit: Optional[float] = None,
+    disable_cookies: bool = False,
 ) -> str:
     wordlist = wordlist or load_default_wordlist()
     assert wordlist, "No wordlist provided"
@@ -73,6 +80,8 @@ async def blind_introspection(  # pylint: disable=too-many-arguments
         max_retries=max_retries,
         backoff=backoff,
         disable_ssl_verify=disable_ssl_verify,
+        rate_limit=rate_limit,
+        disable_cookies=disable_cookies,
     )
 
     logger.info(f"Starting blind introspection on {url}...")
@@ -106,43 +115,89 @@ async def blind_introspection(  # pylint: disable=too-many-arguments
 
     input_document = input_document or "query { FUZZ }"
 
-    while True:
-        logger.info(f"Iteration {iterations}")
-        iterations += 1
-        schema = await oracle.clairvoyance(
-            wordlist,
-            input_document=input_document,
-            input_schema=input_schema,
-        )
+    prev_type_count = 0
+    prev_field_count = 0
+    schema = None
 
-        if output_path:
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(schema)
+    try:
+        while True:
+            logger.info(f"Iteration {iterations}")
+            iterations += 1
+            schema = await oracle.clairvoyance(
+                wordlist,
+                input_document=input_document,
+                input_schema=input_schema,
+            )
 
-        input_schema = json.loads(schema)
-        s = graphql.Schema(schema=input_schema)
+            if output_path:
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(schema)
 
-        _next = s.get_type_without_fields(ignored)
-        ignored.add(_next)
+            input_schema = json.loads(schema)
+            s = graphql.Schema(schema=input_schema)
 
-        if _next:
-            input_document = s.convert_path_to_document(s.get_path_from_root(_next))
-        else:
-            break
+            total_types = len(s.types)
+            total_fields = sum(len(t.fields) for t in s.types.values())
+            new_types = total_types - prev_type_count
+            new_fields = total_fields - prev_field_count
+            logger.info(
+                f"Iteration {iterations - 1} complete: "
+                f"{new_types} new types, {new_fields} new fields, "
+                f"{total_types} total types"
+            )
+            prev_type_count = total_types
+            prev_field_count = total_fields
 
-        if checkpoint_path:
+            _next = s.get_type_without_fields(ignored)
+            ignored.add(_next)
+
+            if _next:
+                try:
+                    path = s.get_path_from_root(_next)
+                except ValueError:
+                    logger.warning(
+                        f"Cannot find path from root to '{_next}'. "
+                        f"This usually means no fields were discovered "
+                        f"(e.g. auth expired or endpoint is blocking requests). "
+                        f"Returning partial results."
+                    )
+                    break
+                input_document = s.convert_path_to_document(path)
+            else:
+                break
+
+            if checkpoint_path:
+                save_checkpoint(
+                    checkpoint_path,
+                    schema=input_schema,
+                    ignored=ignored,
+                    input_document=input_document,
+                    iteration=iterations,
+                    url=url,
+                )
+    except AuthError as e:
+        logger.error(str(e))
+        if checkpoint_path and input_schema:
             save_checkpoint(
                 checkpoint_path,
                 schema=input_schema,
                 ignored=ignored,
-                input_document=input_document,
+                input_document=input_document or "query { FUZZ }",
                 iteration=iterations,
                 url=url,
+            )
+            logger.info(
+                f"Partial results saved to checkpoint: {checkpoint_path}. "
+                f"Re-run with a fresh token to resume."
             )
 
     logger.info("Blind introspection complete.")
     await client().close()
-    return schema
+    if schema:
+        return schema
+    if input_schema:
+        return json.dumps(input_schema)
+    return "{}"
 
 
 def cli(argv: Optional[List[str]] = None) -> None:
@@ -150,7 +205,7 @@ def cli(argv: Optional[List[str]] = None) -> None:
         argv = sys.argv[1:]
 
     args = parse_args(argv)
-    setup_logger(args.verbose)
+    setup_logger(args.verbose, json_log=args.json_log)
 
     headers = {}
     for h in args.headers:
@@ -189,5 +244,7 @@ def cli(argv: Optional[List[str]] = None) -> None:
             backoff=args.backoff,
             disable_ssl_verify=args.no_ssl,
             checkpoint_path=args.checkpoint,
+            rate_limit=args.rate_limit,
+            disable_cookies=args.no_cookies,
         )
     )

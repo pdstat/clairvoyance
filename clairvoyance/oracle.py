@@ -10,7 +10,16 @@ from clairvoyance.entities import GraphQLPrimitive
 from clairvoyance.entities.context import client, config, log
 from clairvoyance.entities.errors import EndpointError
 from clairvoyance.entities.oracle import FuzzingContext
-from clairvoyance.utils import track
+from clairvoyance.utils import ProgressTracker, _format_duration, track
+
+_SANITIZATION_SUFFIXES = re.compile(
+    r"\s*(?:<\[REDACTED\]>|\[FILTERED\]|\[REMOVED\])$"
+)
+
+
+def normalize_error_message(raw: str) -> str:
+    """Strip known server-side sanitization suffixes from error messages."""
+    return _SANITIZATION_SUFFIXES.sub("", raw)
 
 # yapf: disable
 
@@ -29,7 +38,8 @@ _FIELD_REGEXES = {
     ],
     'VALID_FIELD': [
         r"""Field ['"](?P<field>""" + MAIN_REGEX + r""")['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must have a selection of subfields\. Did you mean ['"]""" + MAIN_REGEX + r"""( \{ \.\.\. \})?['"]\?""",
-        r"""Field ['"](?P<field>""" + MAIN_REGEX + r""")['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must have a sub selection\."""
+        r"""Field ['"](?P<field>""" + MAIN_REGEX + r""")['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must have a sub selection\.""",
+        r"""Field ['"](?P<field>""" + MAIN_REGEX + r""")['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must have a selection of subfields\.""",
     ],
     'SINGLE_SUGGESTION': [
         r"""Cannot query field ['"](""" + MAIN_REGEX + r""")['"] on type ['"]""" + MAIN_REGEX + r"""['"]\. Did you mean ['"](?P<field>""" + MAIN_REGEX + r""")['"]\?"""
@@ -65,12 +75,12 @@ _ARG_REGEXES = {
 _TYPEREF_REGEXES = {
     'FIELD': [
         r"""Field ['"]""" + MAIN_REGEX + r"""['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must have a selection of subfields\. Did you mean ['"]""" + MAIN_REGEX + r"""( \{ \.\.\. \})?['"]\?""",
+        r"""Field ['"]""" + MAIN_REGEX + r"""['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must have a selection of subfields\.""",
         r"""Field ['"]""" + MAIN_REGEX + r"""['"] must not have a selection since type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] has no subfields\.""",
         r"""Cannot query field ['"]""" + MAIN_REGEX + r"""['"] on type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"]\.""",
         r"""Cannot query field ['"]""" + MAIN_REGEX + r"""['"] on type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"]\. Did you mean [^\?]+\?""",
         r"""Field ['"]""" + MAIN_REGEX + r"""['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must not have a sub selection\.""",
         r"""Field ['"]""" + MAIN_REGEX + r"""['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must have a sub selection\.""",
-
     ],
     'ARG': [
         r"""Field ['"]""" + MAIN_REGEX + r"""['"] argument ['"]""" + MAIN_REGEX + r"""['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] is """ + REQUIRED_BUT_NOT_PROVIDED,
@@ -187,7 +197,7 @@ async def probe_valid_fields(
             if isinstance(error, str) or not isinstance(error.get("message"), str):
                 continue
 
-            error_message = error["message"]
+            error_message = normalize_error_message(error["message"])
 
             if (
                 "must not have a selection since type" in error_message
@@ -216,6 +226,11 @@ async def probe_valid_fields(
 
     # Process results
     valid_fields = set()
+    progress = ProgressTracker(
+        total=len(tasks),
+        phase="Field discovery",
+        logger=log(),
+    )
     for task in track(
         asyncio.as_completed(tasks),
         description=f"Sending {len(tasks)} fields",
@@ -223,7 +238,9 @@ async def probe_valid_fields(
     ):
         result = await task
         valid_fields.update(result)
+        progress.advance()
 
+    progress.finish()
     return valid_fields
 
 
@@ -250,7 +267,7 @@ async def probe_valid_args(
         if isinstance(error, str) or not isinstance(error.get("message"), str):
             continue
 
-        error_message = error["message"]
+        error_message = normalize_error_message(error["message"])
 
         if (
             "must not have a selection since type" in error_message
@@ -425,11 +442,12 @@ async def probe_typeref(
             if isinstance(error, str) or not isinstance(error.get("message"), str):
                 continue
 
+            msg = normalize_error_message(error["message"])
             typeref = get_typeref(
-                error["message"],
+                msg,
                 context,
             )
-            log().debug(f'get_typeref("{error["message"]}", "{context}") -> {typeref}')
+            log().debug(f'get_typeref("{msg}", "{context}") -> {typeref}')
             if typeref:
                 return typeref
 
@@ -504,7 +522,7 @@ async def probe_typename(input_document: str) -> str:
         for error in errors:
             if isinstance(error, str) or not isinstance(error.get("message"), str):
                 continue
-            match = re.fullmatch(regex, error["message"])
+            match = re.fullmatch(regex, normalize_error_message(error["message"]))
             if match:
                 break
         if match:
@@ -607,11 +625,13 @@ async def clairvoyance(
 
     typename = await probe_typename(input_document)
     log().debug(f"__typename = {typename}")
+    schema.add_type(typename, "OBJECT")
 
     valid_fields = await probe_valid_fields(
         wordlist,
         input_document,
     )
+    log().info(f"Probing {len(valid_fields)} fields on {typename}...")
     log().debug(f"{typename}.fields = {valid_fields}")
 
     tasks: List[asyncio.Task] = []
@@ -627,10 +647,16 @@ async def clairvoyance(
             )
         )
 
+    total = len(tasks)
+    progress = ProgressTracker(
+        total=total,
+        phase=f"Exploring {typename}",
+        logger=log(),
+    )
     for task in track(
         asyncio.as_completed(tasks),
-        description=f"Processing {len(tasks)} responses",
-        total=len(tasks),
+        description=f"Processing {total} responses",
+        total=total,
     ):
         field, args = await task
         for arg in args:
@@ -638,4 +664,14 @@ async def clairvoyance(
         schema.types[typename].fields.append(field)
         schema.add_type(field.type.name, field.type.kind)
 
+        progress.advance()
+        eta_str = _format_duration(progress.eta) if progress.completed > 1 else "calculating"
+        log().info(
+            f"[{progress.completed}/{total}] {typename}.{field.name}: "
+            f"type={field.type.name} ({field.type.kind}), "
+            f"args={len(field.args)} "
+            f"(~{eta_str} remaining)"
+        )
+
+    progress.finish()
     return repr(schema)
