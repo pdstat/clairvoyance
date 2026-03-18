@@ -31,6 +31,18 @@ docker run --rm nikitastupin/clairvoyance --help
 
 ## Advanced Usage
 
+### Resumable scans with checkpoints
+
+Large schemas can take a long time to reconstruct. Use `--checkpoint` to save progress after each iteration and resume if interrupted:
+
+```bash
+clairvoyance https://example.com/graphql -w wordlist.txt --checkpoint scan.checkpoint -o schema.json
+```
+
+If the scan is interrupted (Ctrl+C, network failure, etc.), re-run the same command to resume from where it left off. The checkpoint file stores the discovered schema, the set of already-explored types, and the current iteration counter.
+
+`--checkpoint` is mutually exclusive with `-i/--input-schema`.
+
 ### Which wordlist should I use?
 
 There are at least three approaches:
