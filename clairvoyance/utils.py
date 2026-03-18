@@ -1,9 +1,124 @@
 import argparse
+import io
+import json
 import logging
+import os
+import sys
+import time
 from os import getenv
 from typing import Any, Iterable, List
 
 from rich.progress import track as rich_track
+
+
+class FlushingStreamHandler(logging.StreamHandler):
+    """StreamHandler that writes directly to the fd for real-time output.
+
+    Python's logging StreamHandler buffers output when stderr is a pipe
+    (non-TTY). Even calling stream.flush() only flushes Python's buffer,
+    not the kernel pipe buffer. This subclass writes formatted log lines
+    directly via os.write() to bypass all Python-level buffering.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            data = (msg + self.terminator).encode()
+            try:
+                fd = self.stream.fileno()
+                os.write(fd, data)
+            except (io.UnsupportedOperation, OSError, AttributeError):
+                self.stream.write(msg + self.terminator)
+                self.stream.flush()
+        except Exception:
+            self.handleError(record)
+
+
+class JsonLogFormatter(logging.Formatter):
+    """Emits one JSON object per line for agent-friendly consumption."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "message": record.getMessage(),
+        }
+        if hasattr(record, "event_data"):
+            entry.update(record.event_data)
+        return json.dumps(entry)
+
+
+class ProgressTracker:
+    """Wall-clock progress tracker with ETA estimation.
+
+    Call advance() after each unit of work completes. Emits an INFO log
+    at most every `interval` seconds with rate and time remaining.
+    """
+
+    def __init__(
+        self,
+        total: int,
+        phase: str,
+        logger: logging.Logger,
+        interval: float = 30.0,
+    ) -> None:
+        self._total = total
+        self._phase = phase
+        self._logger = logger
+        self._interval = interval
+        self._completed = 0
+        self._start = time.monotonic()
+        self._last_report = 0.0
+
+    def advance(self, n: int = 1) -> None:
+        self._completed += n
+        now = time.monotonic()
+        if now - self._last_report >= self._interval:
+            self._report(now)
+            self._last_report = now
+
+    def finish(self) -> None:
+        elapsed = time.monotonic() - self._start
+        self._logger.info(
+            f"{self._phase}: done ({self._completed} items "
+            f"in {_format_duration(elapsed)})"
+        )
+
+    def _report(self, now: float) -> None:
+        elapsed = now - self._start
+        rate = self._completed / elapsed if elapsed > 0 else 0
+        remaining = self._total - self._completed
+        eta = remaining / rate if rate > 0 else 0
+        self._logger.info(
+            f"{self._phase}: {self._completed}/{self._total} "
+            f"({rate:.1f}/s, ~{_format_duration(eta)} remaining)"
+        )
+
+    @property
+    def completed(self) -> int:
+        return self._completed
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self._start
+
+    @property
+    def eta(self) -> float:
+        elapsed = self.elapsed
+        rate = self._completed / elapsed if elapsed > 0 else 0
+        remaining = self._total - self._completed
+        return remaining / rate if rate > 0 else 0
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        m, s = divmod(seconds, 60)
+        return f"{int(m)}m{int(s)}s"
+    h, remainder = divmod(seconds, 3600)
+    m, _ = divmod(remainder, 60)
+    return f"{int(h)}h{int(m)}m"
 
 
 class Tracker:
@@ -141,6 +256,22 @@ def parse_args(args: List[str]) -> argparse.Namespace:
         metavar="<file>",
         help="Checkpoint file for resumable scans. Resumes if file exists, otherwise starts fresh.",
     )
+    parser.add_argument(
+        "--json-log",
+        action="store_true",
+        help="Emit one JSON object per log line for agent-friendly consumption",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        metavar="<float>",
+        type=float,
+        help="Max requests per second (e.g. 5 = 5 req/s). Paces requests to avoid WAF/rate-limit blocks.",
+    )
+    parser.add_argument(
+        "--no-cookies",
+        action="store_true",
+        help="Disable cookie jar (cookies are persisted across requests by default)",
+    )
     parser.add_argument("url")
 
     parsed_args = parser.parse_args(args)
@@ -157,17 +288,42 @@ def parse_args(args: List[str]) -> argparse.Namespace:
     return parsed_args
 
 
-def setup_logger(verbosity: int) -> None:
-    fmt = getenv("LOG_FMT") or "%(asctime)s \t%(levelname)s\t| %(message)s"
+def _force_unbuffered_stderr() -> None:
+    """Replace sys.stderr with an unbuffered wrapper at the fd level.
+
+    When stderr is a pipe (e.g. captured by a subprocess), Python defaults
+    to block-buffered I/O. This forces write-through mode so that every
+    write is immediately visible to the parent process.
+    """
+    if hasattr(sys.stderr, "fileno"):
+        try:
+            fd = os.dup(sys.stderr.fileno())
+            sys.stderr = io.TextIOWrapper(
+                os.fdopen(fd, "wb", buffering=0),
+                write_through=True,
+            )
+        except (io.UnsupportedOperation, OSError):
+            pass
+
+
+def setup_logger(verbosity: int, json_log: bool = False) -> None:
+    _force_unbuffered_stderr()
+
     datefmt = getenv("LOG_DATEFMT") or "%Y-%m-%d %H:%M:%S"
 
     default_level = getenv("LOG_LEVEL") or "INFO"
     level = "DEBUG" if verbosity >= 1 else default_level.upper()
 
-    logging.basicConfig(
-        level=level,
-        format=fmt,
-        datefmt=datefmt,
-    )
+    if json_log:
+        handler = FlushingStreamHandler()
+        handler.setFormatter(JsonLogFormatter(datefmt=datefmt))
+        logging.root.addHandler(handler)
+        logging.root.setLevel(level)
+    else:
+        fmt = getenv("LOG_FMT") or "%(asctime)s \t%(levelname)s\t| %(message)s"
+        handler = FlushingStreamHandler()
+        handler.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
+        logging.root.addHandler(handler)
+        logging.root.setLevel(level)
 
     logging.getLogger("asyncio").setLevel(logging.ERROR)
