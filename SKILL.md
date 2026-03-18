@@ -58,13 +58,14 @@ Both tools should share the same root output directory per target. The combined 
 
 ### Recommended Workflow
 
-**Step 1 -- Run gqlextractor first** to extract field names from the target's JavaScript:
+**Step 1 -- Run gqlextractor first** to extract field names from the target's JavaScript.
+See the **gqlextractor skill** (`~/.claude/skills/gqlextractor/SKILL.md`) for full usage. The most common input is a local directory of JavaScript files saved during recon:
 ```bash
-# Extract from JS files found via recon (waymore, xnlinkfinder, etc.)
-gqlextractor --input-urls=js_urls.txt --output-directory=./target-graphql --output-mode=all --search-field=id
+# Extract from locally saved JS files (downloaded via waymore, DevTools, wget, etc.)
+gqlextractor --input-directory=./downloaded-js --output-directory=./target-graphql --output-mode=operations --output-mode=fields
 
-# Or from local JS bundles
-gqlextractor --input-directory=./js-files --output-directory=./target-graphql --output-mode=operations --output-mode=fields
+# Or from remote JS URLs if you have a URL list
+gqlextractor --input-urls=js_urls.txt --output-directory=./target-graphql --output-mode=operations --output-mode=fields
 ```
 
 **Step 2 -- Run clairvoyance** using gqlextractor's field wordlist:
@@ -125,12 +126,16 @@ python -m clairvoyance -H "Authorization: Bearer TOKEN" -H "X-API-Key: KEY123" h
 ```
 
 ### 2. Full Pipeline with gqlextractor (Preferred)
+
+Refer to the **gqlextractor skill** (`~/.claude/skills/gqlextractor/SKILL.md`) for full gqlextractor usage details. The most common scenario is extracting from locally saved JavaScript files (downloaded via waymore, browser DevTools, or manual recon).
+
 ```bash
 OUTPUT=./target-graphql
 mkdir -p "$OUTPUT/schema"
 
-# Phase 1: Extract fields from JS
-gqlextractor --input-urls=js_urls.txt --output-directory="$OUTPUT" --output-mode=fields --output-mode=operations
+# Phase 1: Extract fields from local JS files (most common case)
+# See gqlextractor skill for full options (--input-urls, --input-schema, etc.)
+gqlextractor --input-directory=./downloaded-js --output-directory="$OUTPUT" --output-mode=fields --output-mode=operations
 
 # Phase 2: Blind introspection with extracted wordlist
 python -m clairvoyance \
