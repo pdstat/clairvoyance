@@ -4,15 +4,15 @@ import logging
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from clairvoyance import graphql, oracle
-from clairvoyance.checkpoint import load_checkpoint, save_checkpoint
+from clairvoyance.checkpoint import save_checkpoint
 from clairvoyance.client import Client
 from clairvoyance.config import Config
 from clairvoyance.entities import GraphQLPrimitive
 from clairvoyance.entities.context import client, logger_ctx
-from clairvoyance.entities.errors import AuthError
+from clairvoyance.entities.errors import AuthError, ServerError
 from clairvoyance.utils import parse_args, setup_logger
 
 
@@ -49,6 +49,30 @@ def load_default_wordlist() -> List[str]:
     wl = Path(__file__).parent / "wordlist.txt"
     with open(wl, "r", encoding="utf-8") as f:
         return [w.strip() for w in f.readlines() if w.strip()]
+
+
+def _make_checkpoint_callback(
+    checkpoint_path: str,
+    ignored: set,
+    input_document: str,
+    iteration: int,
+    url: str,
+    logger: logging.Logger,
+) -> Callable[[str], None]:
+    """Build a callback that saves an incremental checkpoint."""
+
+    def _save(schema_json: str) -> None:
+        schema = json.loads(schema_json)
+        save_checkpoint(
+            checkpoint_path,
+            schema=schema,
+            ignored=ignored,
+            input_document=input_document,
+            iteration=iteration,
+            url=url,
+        )
+
+    return _save
 
 
 async def blind_introspection(  # pylint: disable=too-many-arguments
@@ -91,23 +115,21 @@ async def blind_introspection(  # pylint: disable=too-many-arguments
     iterations = 1
 
     if checkpoint_path and Path(checkpoint_path).exists():
+        from clairvoyance.checkpoint import load_checkpoint
+
         state = load_checkpoint(checkpoint_path)
         if state.url != url:
             logger.warning(
-                f"Checkpoint URL ({state.url}) differs from provided URL ({url})"
+                f"Checkpoint URL ({state.url}) differs from "
+                f"provided URL ({url})"
             )
         input_schema = state.schema
         ignored = state.ignored
         iterations = state.iteration
-        s = graphql.Schema(schema=input_schema)
-        _next = s.get_type_without_fields(ignored)
-        if _next:
-            ignored.add(_next)
-            input_document = s.convert_path_to_document(s.get_path_from_root(_next))
-        else:
-            logger.info("Checkpoint already complete, nothing to resume.")
-            await client().close()
-            return json.dumps(input_schema)
+        # Always resume with the saved input_document so the current
+        # iteration is re-run. The 12b skip logic avoids re-exploring
+        # fields already in the schema.
+        input_document = state.input_document
         logger.info(f"Resumed from checkpoint at iteration {iterations}")
     elif input_schema_path:
         with open(input_schema_path, "r", encoding="utf-8") as f:
@@ -122,12 +144,25 @@ async def blind_introspection(  # pylint: disable=too-many-arguments
     try:
         while True:
             logger.info(f"Iteration {iterations}")
-            iterations += 1
+
+            on_field_complete = None
+            if checkpoint_path:
+                on_field_complete = _make_checkpoint_callback(
+                    checkpoint_path,
+                    ignored=ignored,
+                    input_document=input_document,
+                    iteration=iterations,
+                    url=url,
+                    logger=logger,
+                )
+
             schema = await oracle.clairvoyance(
                 wordlist,
                 input_document=input_document,
                 input_schema=input_schema,
+                on_field_complete=on_field_complete,
             )
+            iterations += 1
 
             if output_path:
                 with open(output_path, "w", encoding="utf-8") as f:
@@ -158,8 +193,8 @@ async def blind_introspection(  # pylint: disable=too-many-arguments
                     logger.warning(
                         f"Cannot find path from root to '{_next}'. "
                         f"This usually means no fields were discovered "
-                        f"(e.g. auth expired or endpoint is blocking requests). "
-                        f"Returning partial results."
+                        f"(e.g. auth expired or endpoint is blocking "
+                        f"requests). Returning partial results."
                     )
                     break
                 input_document = s.convert_path_to_document(path)
@@ -175,7 +210,7 @@ async def blind_introspection(  # pylint: disable=too-many-arguments
                     iteration=iterations,
                     url=url,
                 )
-    except AuthError as e:
+    except (AuthError, ServerError) as e:
         logger.error(str(e))
         if checkpoint_path and input_schema:
             save_checkpoint(
@@ -189,6 +224,20 @@ async def blind_introspection(  # pylint: disable=too-many-arguments
             logger.info(
                 f"Partial results saved to checkpoint: {checkpoint_path}. "
                 f"Re-run with a fresh token to resume."
+            )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Interrupted. Saving partial results...")
+        if checkpoint_path and input_schema:
+            save_checkpoint(
+                checkpoint_path,
+                schema=input_schema,
+                ignored=ignored,
+                input_document=input_document or "query { FUZZ }",
+                iteration=iterations,
+                url=url,
+            )
+            logger.info(
+                f"Partial results saved to checkpoint: {checkpoint_path}."
             )
 
     logger.info("Blind introspection complete.")
@@ -224,27 +273,33 @@ def cli(argv: Optional[List[str]] = None) -> None:
             w for w in wordlist if re.match(r"[_A-Za-z][_0-9A-Za-z]*", w)
         ]
         logging.info(
-            f"Removed {len(wordlist) - len(wordlist_parsed)} items from wordlist, to conform to name regex. "
+            f"Removed {len(wordlist) - len(wordlist_parsed)} items from "
+            f"wordlist, to conform to name regex. "
             f"https://spec.graphql.org/June2018/#sec-Names"
         )
         wordlist = wordlist_parsed
 
-    asyncio.run(
-        blind_introspection(
-            args.url,
-            logger=logging.getLogger("clairvoyance"),
-            concurrent_requests=args.concurrent_requests,
-            headers=headers,
-            input_document=args.document,
-            input_schema_path=args.input_schema,
-            output_path=args.output,
-            wordlist=wordlist,
-            proxy=args.proxy,
-            max_retries=args.max_retries,
-            backoff=args.backoff,
-            disable_ssl_verify=args.no_ssl,
-            checkpoint_path=args.checkpoint,
-            rate_limit=args.rate_limit,
-            disable_cookies=args.no_cookies,
+    try:
+        asyncio.run(
+            blind_introspection(
+                args.url,
+                logger=logging.getLogger("clairvoyance"),
+                concurrent_requests=args.concurrent_requests,
+                headers=headers,
+                input_document=args.document,
+                input_schema_path=args.input_schema,
+                output_path=args.output,
+                wordlist=wordlist,
+                proxy=args.proxy,
+                max_retries=args.max_retries,
+                backoff=args.backoff,
+                disable_ssl_verify=args.no_ssl,
+                checkpoint_path=args.checkpoint,
+                rate_limit=args.rate_limit,
+                disable_cookies=args.no_cookies,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        logging.getLogger("clairvoyance").info(
+            "Interrupted by user (Ctrl+C)."
+        )

@@ -16,6 +16,16 @@ _SANITIZATION_SUFFIXES = re.compile(
     r"\s*(?:<\[REDACTED\]>|\[FILTERED\]|\[REMOVED\])$"
 )
 
+# Batch arg type probing regexes — extract type AND sentinel value
+_EXPECTED_TYPE_RE = re.compile(
+    r"""Expected type (?P<typeref>[_0-9A-Za-z.\[\]!]+), """
+    r"""found (?P<found>.+)\."""
+)
+_CANNOT_REPRESENT_RE = re.compile(
+    r"""(?P<scalar>String|Int|Float|ID|Boolean) cannot """
+    r"""represent[^:]*: (?P<found>.+)"""
+)
+
 
 def normalize_error_message(raw: str) -> str:
     """Strip known server-side sanitization suffixes from error messages."""
@@ -77,8 +87,11 @@ _TYPEREF_REGEXES = {
         r"""Field ['"]""" + MAIN_REGEX + r"""['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must have a selection of subfields\. Did you mean ['"]""" + MAIN_REGEX + r"""( \{ \.\.\. \})?['"]\?""",
         r"""Field ['"]""" + MAIN_REGEX + r"""['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must have a selection of subfields\.""",
         r"""Field ['"]""" + MAIN_REGEX + r"""['"] must not have a selection since type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] has no subfields\.""",
-        r"""Cannot query field ['"]""" + MAIN_REGEX + r"""['"] on type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"]\.""",
-        r"""Cannot query field ['"]""" + MAIN_REGEX + r"""['"] on type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"]\. Did you mean [^\?]+\?""",
+        # NOTE: "Cannot query field X on type Y" patterns were removed here.
+        # That error means field X is INVALID on type Y — it does NOT reveal
+        # the field's return type. Matching it produced false positives where
+        # invalid fields were added with type=ParentType (e.g. type=Query).
+        # probe_typename uses its own _WRONG_TYPENAME regexes for this pattern.
         r"""Field ['"]""" + MAIN_REGEX + r"""['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must not have a sub selection\.""",
         r"""Field ['"]""" + MAIN_REGEX + r"""['"] of type ['"](?P<typeref>""" + MAIN_REGEX + r""")['"] must have a sub selection\.""",
     ],
@@ -299,6 +312,7 @@ async def probe_args(
     field: str,
     wordlist: List[str],
     input_document: str,
+    typename: str = "",
 ) -> Set[str]:
     """Wrapper function for deducing the arg types."""
 
@@ -309,11 +323,17 @@ async def probe_args(
             asyncio.create_task(probe_valid_args(field, bucket, input_document))
         )
 
+    num_buckets = len(tasks)
+    prefix = f"{typename}.{field}" if typename else field
+    log().info(f"  Probing args of {prefix} ({num_buckets} buckets)...")
+
     valid_args: Set[str] = set()
 
-    results = await asyncio.gather(*tasks)
-    for result in results:
+    for i, coro in enumerate(asyncio.as_completed(tasks), 1):
+        result = await coro
         valid_args |= result
+        if i == num_buckets or (num_buckets > 4 and i % max(1, num_buckets // 4) == 0):
+            log().info(f"  Arg discovery for {prefix}: {i}/{num_buckets} buckets")
 
     return valid_args
 
@@ -464,9 +484,10 @@ async def probe_typeref(
             typeref = result
 
     if not typeref and context != FuzzingContext.ARGUMENT:
-        error_message = f"Unable to get TypeRef for {documents} in context {context}. "
-        error_message += "It is very likely that Field Suggestion is not fully enabled on this endpoint."
-        raise EndpointError(error_message)
+        log().warning(
+            f"Could not determine type for {documents[0]}. "
+            f"Skipping field (unknown type)."
+        )
 
     return typeref
 
@@ -501,6 +522,114 @@ async def probe_arg_typeref(
     ]
 
     return await probe_typeref(documents, FuzzingContext.ARGUMENT)
+
+
+async def probe_arg_typerefs_batch(
+    field: str,
+    arg_names: List[str],
+    input_document: str,
+) -> Dict[str, Optional[graphql.TypeRef]]:
+    """Batch-probe arg types using unique sentinel values.
+
+    Sends 1-2 requests instead of N*5, mapping error messages back
+    to specific args via unique integer/string sentinels in the values.
+    Falls back to individual probing for unresolved args.
+    """
+    results: Dict[str, Optional[graphql.TypeRef]] = {}
+    unresolved = list(arg_names)
+
+    # Batch 1: Int sentinels (7001, 7002, ...)
+    if unresolved:
+        results, unresolved = await _batch_probe_args(
+            field, unresolved, input_document,
+            value_fn=lambda i: str(7001 + i),
+            sentinel_fn=lambda i: str(7001 + i),
+        )
+
+    # Batch 2: String sentinels for remaining args
+    if unresolved:
+        batch2, unresolved = await _batch_probe_args(
+            field, unresolved, input_document,
+            value_fn=lambda i: f'"t{7001 + i}"',
+            sentinel_fn=lambda i: f'"t{7001 + i}"',
+        )
+        results.update(batch2)
+
+    # Fallback: individual probing for still-unresolved args
+    for arg in unresolved:
+        typeref = await probe_arg_typeref(field, arg, input_document)
+        results[arg] = typeref
+
+    return results
+
+
+async def _batch_probe_args(
+    field: str,
+    arg_names: List[str],
+    input_document: str,
+    value_fn: Any,
+    sentinel_fn: Any,
+) -> Tuple[Dict[str, Optional[graphql.TypeRef]], List[str]]:
+    """Send one batch request and extract arg types from errors."""
+    sentinel_to_arg: Dict[str, str] = {}
+    arg_parts = []
+    for i, arg in enumerate(arg_names):
+        sentinel = sentinel_fn(i)
+        sentinel_to_arg[sentinel] = arg
+        arg_parts.append(f"{arg}: {value_fn(i)}")
+
+    doc = input_document.replace(
+        "FUZZ", f'{field}({", ".join(arg_parts)})'
+    )
+    response = await client().post(doc)
+
+    resolved: Dict[str, Optional[graphql.TypeRef]] = {}
+    for error in response.get("errors", []):
+        if isinstance(error, str):
+            continue
+        if not isinstance(error.get("message"), str):
+            continue
+
+        msg = normalize_error_message(error["message"])
+
+        # "Expected type X, found <sentinel>."
+        match = _EXPECTED_TYPE_RE.fullmatch(msg)
+        if match:
+            found = match.group("found")
+            arg = sentinel_to_arg.get(found)
+            if arg and arg not in resolved:
+                typeref = get_typeref(msg, FuzzingContext.ARGUMENT)
+                if typeref:
+                    resolved[arg] = typeref
+            continue
+
+        # "String cannot represent a non string value: <sentinel>"
+        match = _CANNOT_REPRESENT_RE.fullmatch(msg)
+        if match:
+            scalar = match.group("scalar")
+            found = match.group("found")
+            arg = sentinel_to_arg.get(found)
+            if arg and arg not in resolved:
+                resolved[arg] = graphql.TypeRef(
+                    name=scalar, kind="SCALAR",
+                )
+            continue
+
+        # "Field X argument Y of type Z is required..."
+        typeref = get_typeref(msg, FuzzingContext.ARGUMENT)
+        if typeref:
+            # Extract arg name from "required but not provided"
+            req_match = re.search(
+                r"""argument ['"](?P<arg>[_A-Za-z][_0-9A-Za-z]*)['"]""",
+                msg,
+            )
+            if req_match:
+                arg = req_match.group("arg")
+                if arg in sentinel_to_arg.values() and arg not in resolved:
+                    resolved[arg] = typeref
+
+    unresolved = [a for a in arg_names if a not in resolved]
+    return resolved, unresolved
 
 
 async def probe_typename(input_document: str) -> str:
@@ -563,53 +692,18 @@ async def fetch_root_typenames() -> Dict[str, Optional[str]]:
     return typenames
 
 
-async def explore_field(
-    field_name: str,
-    input_document: str,
-    wordlist: List[str],
-    typename: str,
-) -> Tuple[graphql.Field, List[graphql.InputValue]]:
-    """Perform exploration on a field."""
-
-    typeref = await probe_field_type(
-        field_name,
-        input_document,
-    )
-
-    args = []
-    field = graphql.Field(field_name, typeref)
-    if field.type.name in GraphQLPrimitive:
-        log().debug(f'Skip probe_args() for "{field.name}" of type "{field.type.name}"')
-    else:
-        arg_names = await probe_args(
-            field.name,
-            wordlist,
-            input_document,
-        )
-
-        log().debug(f"{typename}.{field_name}.args = {arg_names}")
-        for arg_name in arg_names:
-            arg_typeref = await probe_arg_typeref(field.name, arg_name, input_document)
-
-            if not arg_typeref:
-                log().debug(
-                    f"Skip argument {arg_name} because TypeRef equals {arg_typeref}"
-                )
-                continue
-
-            arg = graphql.InputValue(arg_name, arg_typeref)
-
-            field.args.append(arg)
-            args.append(arg)
-
-    return field, args
-
-
 async def clairvoyance(
     wordlist: List[str],
     input_document: str,
     input_schema: Optional[Dict[str, Any]] = None,
+    on_field_complete: Optional[Any] = None,
 ) -> str:
+    """Run one iteration of schema discovery.
+
+    Args:
+        on_field_complete: Optional callback(schema_json: str) called
+            after each field is fully explored, for incremental checkpoints.
+    """
 
     log().debug(f"input_document = {input_document}")
 
@@ -627,51 +721,158 @@ async def clairvoyance(
     log().debug(f"__typename = {typename}")
     schema.add_type(typename, "OBJECT")
 
+    # Ensure the root type reference is set so checkpoints preserve it.
+    # fetch_root_typenames may have failed (e.g. server requires auth for
+    # __typename), but probe_typename discovered the name via error messages.
+    if input_document.lstrip().startswith("query"):
+        if not schema._schema["queryType"]:
+            schema._schema["queryType"] = {"name": typename}
+    elif input_document.lstrip().startswith("mutation"):
+        if not schema._schema["mutationType"]:
+            schema._schema["mutationType"] = {"name": typename}
+    elif input_document.lstrip().startswith("subscription"):
+        if not schema._schema["subscriptionType"]:
+            schema._schema["subscriptionType"] = {"name": typename}
+
     valid_fields = await probe_valid_fields(
         wordlist,
         input_document,
     )
-    log().info(f"Probing {len(valid_fields)} fields on {typename}...")
-    log().debug(f"{typename}.fields = {valid_fields}")
 
-    tasks: List[asyncio.Task] = []
-    for field_name in valid_fields:
-        tasks.append(
-            asyncio.create_task(
-                explore_field(
-                    field_name,
-                    input_document,
-                    wordlist,
-                    typename,
-                )
-            )
+    existing_fields = set()
+    if typename in schema.types:
+        existing_fields = {f.name for f in schema.types[typename].fields}
+    new_fields = valid_fields - existing_fields
+    if existing_fields & valid_fields:
+        skipped = existing_fields & valid_fields
+        log().info(
+            f"Skipping {len(skipped)} already-explored fields on "
+            f"{typename}: {sorted(skipped)}"
         )
 
-    total = len(tasks)
-    progress = ProgressTracker(
-        total=total,
-        phase=f"Exploring {typename}",
+    log().info(f"Probing {len(new_fields)} fields on {typename}...")
+    log().debug(f"{typename}.fields = {new_fields}")
+
+    # Phase 1: Probe all field types (fast — 2 requests per field).
+    # Save each to schema immediately so checkpoints capture them.
+    type_tasks: Dict[str, asyncio.Task] = {}
+    for field_name in new_fields:
+        type_tasks[field_name] = asyncio.create_task(
+            probe_field_type(field_name, input_document)
+        )
+
+    new_field_objects: List[graphql.Field] = []
+    type_progress = ProgressTracker(
+        total=len(type_tasks),
+        phase=f"Type probing {typename}",
         logger=log(),
     )
-    for task in track(
-        asyncio.as_completed(tasks),
-        description=f"Processing {total} responses",
-        total=total,
+    for coro in track(
+        asyncio.as_completed(list(type_tasks.values())),
+        description=f"Probing {len(type_tasks)} field types",
+        total=len(type_tasks),
     ):
-        field, args = await task
-        for arg in args:
-            schema.add_type(arg.type.name, "INPUT_OBJECT")
+        typeref = await coro
+        # Find which field this result belongs to
+        done_name = ""
+        for name, task in type_tasks.items():
+            if task.done() and name not in existing_fields:
+                try:
+                    if task.result() is typeref:
+                        done_name = name
+                        break
+                except Exception:
+                    pass
+        if not done_name:
+            continue
+
+        existing_fields.add(done_name)
+        type_progress.advance()
+
+        if typeref is None:
+            log().info(
+                f"  {typename}.{done_name}: type=unknown (skipped)"
+            )
+            continue
+
+        field = graphql.Field(done_name, typeref)
+        new_field_objects.append(field)
         schema.types[typename].fields.append(field)
         schema.add_type(field.type.name, field.type.kind)
 
-        progress.advance()
-        eta_str = _format_duration(progress.eta) if progress.completed > 1 else "calculating"
         log().info(
-            f"[{progress.completed}/{total}] {typename}.{field.name}: "
-            f"type={field.type.name} ({field.type.kind}), "
-            f"args={len(field.args)} "
-            f"(~{eta_str} remaining)"
+            f"  {typename}.{done_name}: type={typeref.name} ({typeref.kind})"
         )
 
-    progress.finish()
+        if on_field_complete:
+            on_field_complete(repr(schema))
+
+    type_progress.finish()
+
+    # Phase 2: Probe args for non-scalar fields (slow — many requests).
+    non_scalar = [
+        f for f in new_field_objects
+        if f.type.name not in GraphQLPrimitive
+    ]
+    if non_scalar:
+        log().info(
+            f"Probing args for {len(non_scalar)} non-scalar fields "
+            f"on {typename}..."
+        )
+    arg_progress = ProgressTracker(
+        total=len(non_scalar),
+        phase=f"Arg probing {typename}",
+        logger=log(),
+    )
+    for field in non_scalar:
+        arg_names = await probe_args(
+            field.name, wordlist, input_document, typename=typename,
+        )
+        arg_list = sorted(arg_names)
+        log().info(
+            f"  {typename}.{field.name}: found {len(arg_names)} args "
+            f"{arg_list}"
+        )
+
+        if arg_names:
+            log().info(
+                f"  Batch-probing {len(arg_list)} arg types for "
+                f"{typename}.{field.name}..."
+            )
+            type_map = await probe_arg_typerefs_batch(
+                field.name, arg_list, input_document,
+            )
+            for arg_name in arg_list:
+                arg_typeref = type_map.get(arg_name)
+                if not arg_typeref:
+                    log().info(
+                        f"    {arg_name} -> unknown (skipped)"
+                    )
+                    continue
+                log().info(
+                    f"    {arg_name} -> {arg_typeref.name} "
+                    f"({arg_typeref.kind})"
+                )
+                arg = graphql.InputValue(arg_name, arg_typeref)
+                field.args.append(arg)
+                schema.add_type(arg.type.name, "INPUT_OBJECT")
+
+        arg_progress.advance()
+        eta_str = (
+            _format_duration(arg_progress.eta)
+            if arg_progress.completed > 1
+            else "calculating"
+        )
+        log().info(
+            f"[{arg_progress.completed}/{len(non_scalar)}] "
+            f"{typename}.{field.name}: args={len(field.args)} "
+            f"[~{eta_str} total remaining]"
+        )
+
+        if on_field_complete:
+            on_field_complete(repr(schema))
+
+    if non_scalar:
+        arg_progress.finish()
+
     return repr(schema)

@@ -282,7 +282,7 @@ def parse_args(args: List[str]) -> argparse.Namespace:
     if parsed_args.profile == "slow":
         set_slow_config(parsed_args)
 
-    if parsed_args.progress:
+    if parsed_args.progress and not parsed_args.json_log:
         Tracker.enable()
 
     return parsed_args

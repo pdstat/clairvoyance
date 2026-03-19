@@ -1,5 +1,6 @@
 """Broader unit test coverage for oracle.py functions."""
 
+import json
 import logging
 import unittest
 
@@ -150,6 +151,108 @@ class TestGetTypeRefEdgeCases(unittest.TestCase):
         self.assertEqual(got.name, "Int")
         self.assertEqual(got.kind, "SCALAR")
         self.assertTrue(got.non_null)
+
+
+class TestUnknownTypeSkipped(aiounittest.AsyncTestCase):
+    """Issue 16: Fields with unknown types are skipped, not crashed."""
+
+    async def test_unknown_type_field_skipped_in_clairvoyance(self) -> None:
+        """Discover one field; type probing returns unrecognized errors."""
+        setup_test_context(
+            responses=[
+                # fetch_root_typenames
+                {"data": {"__typename": "Query"}},
+                {"errors": [{"message": "no mutation"}]},
+                {"errors": [{"message": "no subscription"}]},
+                # probe_typename
+                {"errors": [{"message": 'Cannot query field "IAmWrongField" on type "Query".'}]},
+                # probe_valid_fields: discovers "expiry"
+                {"errors": [
+                    {"message": 'Cannot query field "x" on type "Query". Did you mean "expiry"?'},
+                ]},
+                # probe_field_type for "expiry" (2 docs) — unrecognized
+                {"errors": [{"message": "Some unrecognized error format."}]},
+                {"errors": [{"message": "Another unrecognized error."}]},
+            ],
+            bucket_size=64,
+        )
+        logger = logging.getLogger("clairvoyance.test")
+        with self.assertLogs(logger, level="INFO") as cm:
+            result = await oracle.clairvoyance(
+                wordlist=["x"],
+                input_document="query { FUZZ }",
+            )
+
+        log_text = "\n".join(cm.output)
+        self.assertIn("expiry: type=unknown (skipped)", log_text)
+
+        # Schema should NOT contain "expiry"
+        parsed = json.loads(result)
+        query_type = next(
+            t for t in parsed["data"]["__schema"]["types"]
+            if t["name"] == "Query"
+        )
+        field_names = {f["name"] for f in query_type["fields"]}
+        self.assertNotIn("expiry", field_names)
+
+    async def test_probe_typeref_returns_none_for_unrecognized(self) -> None:
+        setup_test_context(
+            responses=[
+                {"errors": [{"message": "Totally unknown error format."}]},
+            ],
+        )
+        result = await oracle.probe_typeref(
+            ["query { foo }"], FuzzingContext.FIELD,
+        )
+        self.assertIsNone(result)
+
+
+class TestCannotQueryFieldNotTypeRef(unittest.TestCase):
+    """Issue 15: 'Cannot query field' must not produce a TypeRef."""
+
+    def test_plain_cannot_query(self) -> None:
+        setup_test_context()
+        got = oracle.get_typeref(
+            'Cannot query field "foo" on type "Query".',
+            FuzzingContext.FIELD,
+        )
+        self.assertIsNone(got)
+
+    def test_cannot_query_with_suggestion(self) -> None:
+        setup_test_context()
+        got = oracle.get_typeref(
+            'Cannot query field "foo" on type "Query". Did you mean "bar"?',
+            FuzzingContext.FIELD,
+        )
+        self.assertIsNone(got)
+
+    def test_cannot_query_with_inline_fragment_suggestion(self) -> None:
+        setup_test_context()
+        got = oracle.get_typeref(
+            'Cannot query field "msg" on type "Payload". '
+            'Did you mean to use an inline fragment on "Error"?',
+            FuzzingContext.FIELD,
+        )
+        self.assertIsNone(got)
+
+    def test_valid_field_patterns_still_work(self) -> None:
+        """Patterns that DO indicate a field's return type still match."""
+        got = oracle.get_typeref(
+            'Field "users" of type "User" must have a selection of subfields.',
+            FuzzingContext.FIELD,
+        )
+        self.assertIsNotNone(got)
+        self.assertEqual(got.name, "User")
+        self.assertEqual(got.kind, "OBJECT")
+
+    def test_scalar_pattern_still_works(self) -> None:
+        got = oracle.get_typeref(
+            'Field "name" must not have a selection since type "String" has no subfields.',
+            FuzzingContext.FIELD,
+        )
+        self.assertIsNotNone(got)
+        self.assertEqual(got.name, "String")
+        self.assertEqual(got.kind, "SCALAR")
 
 
 class TestProbeValidFields(aiounittest.AsyncTestCase):
@@ -354,7 +457,170 @@ class TestPerFieldProgressLogging(aiounittest.AsyncTestCase):
 
         log_text = "\n".join(cm.output)
         self.assertIn("Probing 1 fields on Query", log_text)
-        self.assertIn("[1/1] Query.users: type=User (OBJECT), args=0", log_text)
+        # Phase 1: type discovery
+        self.assertIn("Query.users: type=User (OBJECT)", log_text)
+        # Phase 2: arg probing
+        self.assertIn("[1/1] Query.users: args=0", log_text)
+
+
+class TestProbeArgsBucketLogging(aiounittest.AsyncTestCase):
+    """Verify probe_args logs bucket progress."""
+
+    async def test_logs_bucket_count(self) -> None:
+        setup_test_context(
+            responses=[
+                {"errors": [{"message": 'Unknown argument "a" on field "f".'}]},
+                {"errors": [{"message": 'Unknown argument "b" on field "f".'}]},
+            ],
+            bucket_size=1,
+        )
+        logger = logging.getLogger("clairvoyance.test")
+        with self.assertLogs(logger, level="INFO") as cm:
+            await oracle.probe_args("f", ["a", "b"], "query { FUZZ }", typename="Query")
+
+        log_text = "\n".join(cm.output)
+        self.assertIn("Probing args of Query.f (2 buckets)", log_text)
+        self.assertIn("2/2 buckets", log_text)
+
+
+class TestBatchArgTypeProbing(aiounittest.AsyncTestCase):
+    """Issue 14: Batch arg type probing with sentinel values."""
+
+    async def test_batch_resolves_expected_type_errors(self) -> None:
+        """Batch 1 (int sentinels) resolves String, Boolean, InputObject."""
+        setup_test_context(
+            responses=[
+                # Batch 1: field(limit: 7001, active: 7002, input: 7003)
+                {"errors": [
+                    {"message": "Expected type String, found 7001."},
+                    {"message": "Expected type Boolean, found 7002."},
+                    {"message": "Expected type SearchInput!, found 7003."},
+                ]},
+            ],
+        )
+        result = await oracle.probe_arg_typerefs_batch(
+            "items", ["limit", "active", "input"], "query { FUZZ }"
+        )
+        self.assertEqual(result["limit"].name, "String")
+        self.assertEqual(result["limit"].kind, "SCALAR")
+        self.assertEqual(result["active"].name, "Boolean")
+        self.assertEqual(result["active"].kind, "SCALAR")
+        self.assertEqual(result["input"].name, "SearchInput")
+        self.assertEqual(result["input"].kind, "INPUT_OBJECT")
+
+    async def test_batch_resolves_cannot_represent(self) -> None:
+        """'String cannot represent' messages also resolve types."""
+        setup_test_context(
+            responses=[
+                {"errors": [
+                    {"message": "String cannot represent a non string value: 7001"},
+                ]},
+            ],
+        )
+        result = await oracle.probe_arg_typerefs_batch(
+            "items", ["name"], "query { FUZZ }"
+        )
+        self.assertEqual(result["name"].name, "String")
+        self.assertEqual(result["name"].kind, "SCALAR")
+
+    async def test_batch_string_fallback_for_unresolved(self) -> None:
+        """Batch 2 (string sentinels) resolves Int args unresolved by batch 1."""
+        setup_test_context(
+            responses=[
+                # Batch 1: no type errors (42 accepted as Int)
+                {"errors": []},
+                # Batch 2: string sentinel reveals Int type
+                {"errors": [
+                    {"message": 'Expected type Int, found "t7001".'},
+                ]},
+            ],
+        )
+        result = await oracle.probe_arg_typerefs_batch(
+            "items", ["count"], "query { FUZZ }"
+        )
+        self.assertEqual(result["count"].name, "Int")
+        self.assertEqual(result["count"].kind, "SCALAR")
+
+    async def test_batch_individual_fallback(self) -> None:
+        """Args unresolved by both batches fall back to individual probing."""
+        setup_test_context(
+            responses=[
+                # Batch 1: no useful errors
+                {"errors": [{"message": "Some unknown error."}]},
+                # Batch 2: no useful errors
+                {"errors": [{"message": "Some unknown error."}]},
+                # Individual probe_arg_typeref for "weird" (5 docs)
+                {"errors": [{"message": 'Expected type WeirdInput!, found 42.'}]},
+                {"errors": []},
+                {"errors": []},
+                {"errors": []},
+                {"errors": []},
+            ],
+        )
+        result = await oracle.probe_arg_typerefs_batch(
+            "items", ["weird"], "query { FUZZ }"
+        )
+        self.assertIsNotNone(result["weird"])
+        self.assertEqual(result["weird"].name, "WeirdInput")
+
+    async def test_batch_multiple_args_one_request(self) -> None:
+        """All args resolved in a single request (best case)."""
+        setup_test_context(
+            responses=[
+                {"errors": [
+                    {"message": "Expected type String, found 7001."},
+                    {"message": "Expected type Int!, found 7002."},
+                    {"message": "Expected type Boolean, found 7003."},
+                ]},
+            ],
+        )
+        result = await oracle.probe_arg_typerefs_batch(
+            "search", ["query", "limit", "active"],
+            "query { FUZZ }",
+        )
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result["query"].name, "String")
+        self.assertEqual(result["limit"].name, "Int")
+        self.assertTrue(result["limit"].non_null)
+        self.assertEqual(result["active"].name, "Boolean")
+
+    async def test_batch_required_arg_gives_type(self) -> None:
+        """'required but not provided' errors resolve arg types."""
+        setup_test_context(
+            responses=[
+                {"errors": [
+                    {"message": 'Field "items" argument "id" of type "ID!" is required, but it was not provided.'},
+                    {"message": "Expected type String, found 7001."},
+                ]},
+            ],
+        )
+        result = await oracle.probe_arg_typerefs_batch(
+            "items", ["name", "id"], "query { FUZZ }"
+        )
+        self.assertEqual(result["name"].name, "String")
+        self.assertEqual(result["id"].name, "ID")
+
+    async def test_batch_with_redacted_suffix(self) -> None:
+        """Batch handles <[REDACTED]> suffix in error messages."""
+        setup_test_context(
+            responses=[
+                {"errors": [
+                    {"message": "Expected type String, found 7001. <[REDACTED]>"},
+                ]},
+            ],
+        )
+        result = await oracle.probe_arg_typerefs_batch(
+            "items", ["name"], "query { FUZZ }"
+        )
+        self.assertEqual(result["name"].name, "String")
+
+    async def test_batch_empty_args(self) -> None:
+        """Empty arg list returns empty dict without requests."""
+        setup_test_context(responses=[])
+        result = await oracle.probe_arg_typerefs_batch(
+            "items", [], "query { FUZZ }"
+        )
+        self.assertEqual(result, {})
 
 
 class TestRedactedSuffixAsync(aiounittest.AsyncTestCase):

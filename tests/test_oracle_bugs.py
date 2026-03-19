@@ -31,19 +31,17 @@ class TestGeneralSkipComma(unittest.TestCase):
 class TestDictErrorMessage(aiounittest.AsyncTestCase):
     """Bug 2: dict error message caused UnboundLocalError."""
 
-    async def test_dict_error_message_field_raises_endpoint_error(self) -> None:
+    async def test_dict_error_message_field_returns_none(self) -> None:
         """With the fix, dict messages are skipped (no UnboundLocalError).
-        FIELD context raises EndpointError because no typeref was found."""
-        from clairvoyance.entities.errors import EndpointError
-
+        FIELD context returns None with a warning instead of raising."""
         setup_test_context(responses=[
             {"errors": [{"message": {"some": "dict"}}]},
         ])
-        with self.assertRaises(EndpointError):
-            await oracle.probe_typeref(
-                ["query { test }"],
-                FuzzingContext.FIELD,
-            )
+        result = await oracle.probe_typeref(
+            ["query { test }"],
+            FuzzingContext.FIELD,
+        )
+        self.assertIsNone(result)
 
     async def test_dict_error_message_arg_returns_none(self) -> None:
         setup_test_context(responses=[

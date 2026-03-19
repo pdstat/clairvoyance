@@ -335,5 +335,29 @@ class TestParseArgsNoCookies(unittest.TestCase):
         self.assertTrue(args.no_cookies)
 
 
+class TestJsonLogDisablesRichProgress(unittest.TestCase):
+    """Problem C: --json-log should disable rich progress bars."""
+
+    def setUp(self) -> None:
+        from clairvoyance.utils import Tracker
+        self._tracker = Tracker
+        self._tracker.disable()
+
+    def tearDown(self) -> None:
+        self._tracker.disable()
+
+    def test_progress_without_json_log(self) -> None:
+        parse_args(["--progress", "http://example.com/graphql"])
+        self.assertTrue(self._tracker._Tracker__enabled)
+
+    def test_json_log_suppresses_progress(self) -> None:
+        parse_args(["--progress", "--json-log", "http://example.com/graphql"])
+        self.assertFalse(self._tracker._Tracker__enabled)
+
+    def test_json_log_without_progress_flag(self) -> None:
+        parse_args(["--json-log", "http://example.com/graphql"])
+        self.assertFalse(self._tracker._Tracker__enabled)
+
+
 if __name__ == "__main__":
     unittest.main()

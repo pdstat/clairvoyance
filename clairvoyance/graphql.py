@@ -73,13 +73,17 @@ class Schema:
     def __repr__(self) -> str:
         """String representation of the schema."""
 
-        schema = {"data": {"__schema": self._schema}}
+        types_json = [t.to_json() for t in self.types.values()]
+        schema = {
+            "data": {
+                "__schema": {
+                    **self._schema,
+                    "types": types_json,
+                }
+            }
+        }
 
-        for t in self.types.values():
-            schema["data"]["__schema"]["types"].append(t.to_json())
-
-        output = json.dumps(schema, indent=4, sort_keys=True)
-        return output
+        return json.dumps(schema, indent=4, sort_keys=True)
 
     def get_path_from_root(
         self,

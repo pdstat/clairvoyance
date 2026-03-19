@@ -544,5 +544,100 @@ class TestCookieJarSession(aiounittest.AsyncTestCase):
             )
 
 
+class TestConsecutiveServerErrors(aiounittest.AsyncTestCase):
+    """Issue 11: Abort on persistent 5xx responses."""
+
+    async def test_raises_server_error_after_threshold(self) -> None:
+        from clairvoyance.entities.errors import ServerError
+
+        c = Client(
+            "http://test/graphql",
+            max_retries=100,
+            max_consecutive_server_errors=3,
+        )
+        resp_502 = _make_mock_response(status=502)
+        mock_session = MagicMock()
+        mock_session.post = AsyncMock(return_value=resp_502)
+        c._session = mock_session
+
+        with self.assertRaises(ServerError) as ctx:
+            await c.post("query { test }")
+
+        self.assertIn("3 consecutive HTTP 5xx", str(ctx.exception))
+
+    async def test_successful_response_resets_server_counter(self) -> None:
+        c = Client(
+            "http://test/graphql",
+            max_retries=100,
+            max_consecutive_server_errors=5,
+        )
+        resp_502 = _make_mock_response(status=502)
+        resp_ok = _make_mock_response(
+            status=200, json_data={"data": {"ok": True}}
+        )
+        mock_session = MagicMock()
+        # 2 failures then success — counter should reset
+        mock_session.post = AsyncMock(
+            side_effect=[resp_502, resp_502, resp_ok]
+        )
+        c._session = mock_session
+
+        result = await c.post("query { test }")
+        self.assertEqual(result, {"data": {"ok": True}})
+        self.assertEqual(c._consecutive_server_errors, 0)
+
+    async def test_default_server_error_threshold_is_ten(self) -> None:
+        c = Client("http://test/graphql")
+        self.assertEqual(c._max_consecutive_server_errors, 10)
+
+    async def test_503_also_tracked(self) -> None:
+        from clairvoyance.entities.errors import ServerError
+
+        c = Client(
+            "http://test/graphql",
+            max_retries=100,
+            max_consecutive_server_errors=2,
+        )
+        resp_503 = _make_mock_response(status=503)
+        mock_session = MagicMock()
+        mock_session.post = AsyncMock(return_value=resp_503)
+        c._session = mock_session
+
+        with self.assertRaises(ServerError):
+            await c.post("query { test }")
+
+
+class TestRetryLoopNotRecursive(aiounittest.AsyncTestCase):
+    """Issue 11: Verify retries use a loop, not recursion.
+
+    With semaphore=1, recursive retries would deadlock because
+    the retry tries to re-acquire the semaphore from within it.
+    """
+
+    async def test_retry_with_semaphore_1_does_not_deadlock(self) -> None:
+        c = Client(
+            "http://test/graphql",
+            max_retries=3,
+            concurrent_requests=1,
+            max_consecutive_server_errors=100,
+        )
+        resp_500 = _make_mock_response(status=500)
+        resp_ok = _make_mock_response(
+            status=200, json_data={"data": {"ok": True}}
+        )
+        mock_session = MagicMock()
+        mock_session.post = AsyncMock(
+            side_effect=[resp_500, resp_500, resp_ok]
+        )
+        c._session = mock_session
+
+        # This would hang forever with recursive post() + semaphore=1
+        result = await asyncio.wait_for(
+            c.post("query { test }"), timeout=5.0
+        )
+        self.assertEqual(result, {"data": {"ok": True}})
+        self.assertEqual(mock_session.post.call_count, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

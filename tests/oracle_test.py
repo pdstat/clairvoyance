@@ -10,6 +10,7 @@ from clairvoyance import graphql, oracle
 from clairvoyance.client import Client
 from clairvoyance.entities.context import client
 from clairvoyance.entities.oracle import FuzzingContext
+from tests.conftest import setup_test_context
 
 
 class TestGetValidFields(unittest.TestCase):
@@ -162,33 +163,27 @@ class TestGetTypeRef(unittest.TestCase):
         )
         self.assertEqual(got, want)
 
-    def test_field_regex_3(self) -> None:
-        want = graphql.TypeRef(
-            name="HomeSettings",
-            kind="OBJECT",
-            is_list=False,
-            non_null_item=False,
-            non_null=False,
-        )
+    def test_cannot_query_field_returns_none(self) -> None:
+        """Issue 15: 'Cannot query field' means the field is invalid.
+
+        This error should NOT return a TypeRef — the type name in the
+        message is the PARENT type, not the field's return type.
+        """
+        setup_test_context()
         got = oracle.get_typeref(
             'Cannot query field "IAmWrongField" on type "HomeSettings".',
             FuzzingContext.FIELD,
         )
-        self.assertEqual(got, want)
+        self.assertIsNone(got)
 
-    def test_field_regex_4(self) -> None:
-        want = graphql.TypeRef(
-            name="InitDomainActionPayload",
-            kind="OBJECT",
-            is_list=False,
-            non_null_item=False,
-            non_null=False,
-        )
+    def test_cannot_query_field_with_suggestion_returns_none(self) -> None:
+        """Issue 15: Same for 'Cannot query field...Did you mean' variant."""
+        setup_test_context()
         got = oracle.get_typeref(
             'Cannot query field "message" on type "InitDomainActionPayload". Did you mean to use an inline fragment on "UserError" or "BaseUserError"?',
             FuzzingContext.FIELD,
         )
-        self.assertEqual(got, want)
+        self.assertIsNone(got)
 
     def test_skip_error_message(self) -> None:
         want = None

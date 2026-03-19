@@ -6,7 +6,7 @@ from typing import Dict, Optional
 import aiohttp
 
 from clairvoyance.entities.context import client_ctx, log
-from clairvoyance.entities.errors import AuthError
+from clairvoyance.entities.errors import AuthError, ServerError
 from clairvoyance.entities.interfaces import IClient
 
 
@@ -28,6 +28,7 @@ class Client(IClient):  # pylint: disable=too-many-instance-attributes
         backoff: Optional[int] = None,
         disable_ssl_verify: Optional[bool] = None,
         max_consecutive_auth_errors: int = 10,
+        max_consecutive_server_errors: int = 10,
         rate_limit: Optional[float] = None,
         disable_cookies: bool = False,
     ) -> None:
@@ -47,7 +48,9 @@ class Client(IClient):  # pylint: disable=too-many-instance-attributes
         self.disable_ssl_verify = disable_ssl_verify or False
         self._consecutive_auth_errors = 0
         self._max_consecutive_auth_errors = max_consecutive_auth_errors
-        self._auth_error_lock = asyncio.Lock()
+        self._consecutive_server_errors = 0
+        self._max_consecutive_server_errors = max_consecutive_server_errors
+        self._error_lock = asyncio.Lock()
         self._rate_limit_delay = 1.0 / rate_limit if rate_limit else 0
         self._rate_limit_lock = asyncio.Lock()
         self._last_request_time = 0.0
@@ -60,23 +63,30 @@ class Client(IClient):  # pylint: disable=too-many-instance-attributes
         document: Optional[str],
         retries: int = 0,
     ) -> Dict:
-        """Post a GraphQL document to the server and return the response as JSON."""
+        """Post a GraphQL document and return the JSON response.
 
-        if retries >= self._max_retries:
-            log().warning(f"Max retries ({self._max_retries}) exceeded for {self._url}")
-            return {"errors": []}
+        Retries are handled via a loop (not recursion) to avoid
+        re-acquiring the semaphore on each retry attempt.
+        """
+        while retries < self._max_retries:
+            result = await self._do_post(document, retries)
+            if result is not None:
+                return result
+            retries += 1
 
+        log().warning(
+            f"Max retries ({self._max_retries}) exceeded for {self._url}"
+        )
+        return {"errors": []}
+
+    async def _do_post(
+        self,
+        document: Optional[str],
+        retries: int,
+    ) -> Optional[Dict]:
+        """Execute one POST attempt. Returns None to signal retry."""
         async with self._semaphore:
-            if not self._session:
-                async with self._session_lock:
-                    if not self._session:
-                        connector = aiohttp.TCPConnector(ssl=not self.disable_ssl_verify)
-                        cookie_jar = aiohttp.DummyCookieJar() if self._disable_cookies else aiohttp.CookieJar()
-                        self._session = aiohttp.ClientSession(
-                            headers=self._headers,
-                            connector=connector,
-                            cookie_jar=cookie_jar,
-                        )
+            await self._ensure_session()
 
             if self._rate_limit_delay:
                 async with self._rate_limit_lock:
@@ -86,7 +96,6 @@ class Client(IClient):  # pylint: disable=too-many-instance-attributes
                         await asyncio.sleep(wait)
                     self._last_request_time = time.monotonic()
 
-            # Translate an existing document into a GraphQL request.
             gql_document = {"query": document} if document else None
             try:
                 response = await self._session.post(
@@ -100,45 +109,83 @@ class Client(IClient):  # pylint: disable=too-many-instance-attributes
                     await self._track_auth_error(response.status)
 
                 if response.status >= 500:
-                    log().warning(f"Received status code {response.status}")
-                    await self._retry_backoff(retries, response.status, document)
-                    return await self.post(document, retries + 1)
+                    await self._track_server_error(response.status)
+                    await self._retry_backoff(
+                        retries, response.status, document
+                    )
+                    return None
 
                 try:
                     result = await response.json(content_type=None)
-                    if response.status not in (401, 403):
-                        self._consecutive_auth_errors = 0
+                    self._reset_error_counters(response.status)
                     return result
                 except json.decoder.JSONDecodeError as e:
                     log().warning(
-                        f"JSON decode error while decoding response from {self._url} (status code: {response.status}): {e}"
+                        f"JSON decode error from {self._url} "
+                        f"(status {response.status}): {e}"
                     )
-                    log().debug(
-                        "[Hint] Endpoint might require authentication, or, site is behind something like Cloudflare and is rate limiting you. "
-                        "You can pass headers and cookies via -H option. Consult "
-                        "https://github.com/nikitastupin/clairvoyance/blob/main/troubleshooting.md for more information."
+                    await self._retry_backoff(
+                        retries, response.status, document
                     )
-                    await self._retry_backoff(retries, response.status, document)
+                    return None
 
             except (
                 aiohttp.ClientConnectionError,
                 aiohttp.ClientPayloadError,
                 asyncio.TimeoutError,
             ) as e:
-                log().warning(f"Connection error while POSTing to {self._url}: {e}")
+                log().warning(
+                    f"Connection error while POSTing to {self._url}: {e}"
+                )
                 await self._retry_backoff(retries, 0, document)
+                return None
 
-        return await self.post(document, retries + 1)
+    async def _ensure_session(self) -> None:
+        if not self._session:
+            async with self._session_lock:
+                if not self._session:
+                    connector = aiohttp.TCPConnector(
+                        ssl=not self.disable_ssl_verify
+                    )
+                    jar = (
+                        aiohttp.DummyCookieJar()
+                        if self._disable_cookies
+                        else aiohttp.CookieJar()
+                    )
+                    self._session = aiohttp.ClientSession(
+                        headers=self._headers,
+                        connector=connector,
+                        cookie_jar=jar,
+                    )
+
+    def _reset_error_counters(self, status: int) -> None:
+        """Reset error counters on a successful (non-error) response."""
+        if status not in (401, 403):
+            self._consecutive_auth_errors = 0
+        self._consecutive_server_errors = 0
 
     async def _track_auth_error(self, status_code: int) -> None:
         """Increment consecutive auth error counter; raise if threshold hit."""
-        async with self._auth_error_lock:
+        async with self._error_lock:
             self._consecutive_auth_errors += 1
             count = self._consecutive_auth_errors
         if count >= self._max_consecutive_auth_errors:
             raise AuthError(
                 f"Received {count} consecutive HTTP {status_code} responses. "
                 f"Token may have expired or endpoint is rejecting requests. "
+                f"Partial results may be available via checkpoint."
+            )
+
+    async def _track_server_error(self, status_code: int) -> None:
+        """Increment consecutive 5xx counter; raise if threshold hit."""
+        async with self._error_lock:
+            self._consecutive_server_errors += 1
+            count = self._consecutive_server_errors
+        log().warning(f"Received status code {status_code}")
+        if count >= self._max_consecutive_server_errors:
+            raise ServerError(
+                f"Received {count} consecutive HTTP 5xx responses. "
+                f"Server may be down or unresponsive. "
                 f"Partial results may be available via checkpoint."
             )
 
