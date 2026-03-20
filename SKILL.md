@@ -168,7 +168,7 @@ The checkpoint file saves:
 
 **Note:** `--checkpoint` is mutually exclusive with `-i/--input-schema`.
 
-### 4. Speed Profiles
+### 4. Speed Profiles and Rate Limiting
 ```bash
 # Fast mode (default) - high concurrency, quick results
 python -m clairvoyance https://target.com/graphql
@@ -178,6 +178,9 @@ python -m clairvoyance -p slow https://target.com/graphql
 
 # Custom concurrency and retry settings
 python -m clairvoyance -c 10 -m 20 -b 3 https://target.com/graphql
+
+# Rate limit to N requests per second
+python -m clairvoyance --rate-limit 5 https://target.com/graphql
 ```
 
 ### 5. Through a Proxy
@@ -189,7 +192,25 @@ python -m clairvoyance -x http://127.0.0.1:8080 https://target.com/graphql
 python -m clairvoyance -x http://127.0.0.1:8080 -k https://target.com/graphql
 ```
 
-### 6. Building on Partial Schema
+### 6. Logging and Progress
+```bash
+# Rich progress bar for long scans
+python -m clairvoyance --progress https://target.com/graphql
+
+# JSON log output (one JSON object per line, for agent/pipeline consumption)
+python -m clairvoyance --json-log https://target.com/graphql
+
+# Verbose/debug logging
+python -m clairvoyance -v https://target.com/graphql
+```
+
+### 7. Cookie Control
+```bash
+# Disable cookie persistence (enabled by default)
+python -m clairvoyance --no-cookies https://target.com/graphql
+```
+
+### 8. Building on Partial Schema
 ```bash
 # Start from an existing partial schema (e.g., from a previous run or manual discovery)
 python -m clairvoyance -i partial_schema.json -o full_schema.json https://target.com/graphql
@@ -203,19 +224,22 @@ python -m clairvoyance -d "query { user { FUZZ } }" https://target.com/graphql
 | Flag | Description |
 |------|-------------|
 | `-w <file>` | Custom wordlist (one word per line) |
+| `-wv` | Validate wordlist against GraphQL name regex |
 | `-o <file>` | Output file for JSON schema |
 | `-i <file>` | Input partial schema to supplement |
-| `--checkpoint <file>` | Checkpoint file for resumable scans |
 | `-d <string>` | Starting document (default: `query { FUZZ }`) |
 | `-H <header>` | HTTP header (repeatable, format: `Key: Value`) |
 | `-c <int>` | Number of concurrent requests |
-| `-p slow\|fast` | Speed profile |
+| `-p slow\|fast` | Speed profile (default: `fast`) |
 | `-x <url>` | Proxy URL |
 | `-k` | Disable SSL verification |
 | `-m <int>` | Max retries per request |
-| `-b <int>` | Exponential backoff factor |
-| `-wv` | Validate wordlist against GraphQL name regex |
-| `--progress` | Show progress bar |
+| `-b <int>` | Exponential backoff factor (`0.5 * backoff**retries` seconds) |
+| `--checkpoint <file>` | Checkpoint file for resumable scans |
+| `--progress` | Show rich progress bar |
+| `--rate-limit <float>` | Max requests per second (e.g. `5` = 5 req/s) |
+| `--json-log` | Emit one JSON object per log line (agent/machine-readable) |
+| `--no-cookies` | Disable cookie jar (cookies persisted by default) |
 | `-v` | Verbose/debug logging |
 
 ## Output Format
@@ -302,7 +326,13 @@ cat schema.json | python -c "import json,sys; d=json.load(sys.stdin); [print(t['
 - Use slow profile: `-p slow`
 - Reduce concurrency: `-c 1`
 - Add backoff: `-b 3`
+- Use rate limiting: `--rate-limit 5` (5 requests/second)
 - Route through a proxy to monitor responses: `-x http://127.0.0.1:8080`
+
+### Auth or Server Errors
+- Clairvoyance detects consecutive 401/403 (auth) and 5xx (server) errors and aborts with a checkpoint save after 10 in a row
+- If auth expires mid-scan, re-run with a fresh token and `--checkpoint` to resume
+- Use `-v` to see raw HTTP status codes in debug output
 
 ### Checkpoint Issues
 - Checkpoint URL differs from current URL: this is a warning only, the scan continues

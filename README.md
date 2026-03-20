@@ -13,6 +13,8 @@ Some GraphQL APIs have disabled introspection. For example, [Apollo Server disab
 
 Clairvoyance helps to obtain GraphQL API schema even if the introspection is disabled. It produces schema in JSON format suitable for other tools like [GraphQL Voyager](https://github.com/APIs-guru/graphql-voyager), [InQL](https://github.com/doyensec/inql) or [graphql-path-enum](https://gitlab.com/dee-see/graphql-path-enum).
 
+> **Note:** This is a fork of [nikitastupin/clairvoyance](https://github.com/nikitastupin/clairvoyance) with additional features including resumable checkpoint scans, rate limiting, proxy support, batch argument probing, auth/server error detection, progress tracking, and JSON logging.
+
 ## Getting Started
 
 ### pip
@@ -31,6 +33,36 @@ docker run --rm nikitastupin/clairvoyance --help
 
 ## Advanced Usage
 
+### Speed profiles
+
+Use `-p` to select a speed profile:
+
+```bash
+# Fast mode (default) - high concurrency for quick results
+clairvoyance https://example.com/graphql
+
+# Slow mode - single worker, retries, backoff (for rate-limited targets)
+clairvoyance -p slow https://example.com/graphql
+```
+
+Slow mode sets concurrency to 1, max retries to 50, and backoff factor to 2.
+
+### Rate limiting
+
+Pace requests to avoid WAF or rate-limit blocks:
+
+```bash
+clairvoyance --rate-limit 5 https://example.com/graphql  # 5 requests/second
+```
+
+### Proxy and SSL
+
+Route traffic through a proxy (e.g. Burp Suite or Caido) and optionally disable SSL verification:
+
+```bash
+clairvoyance -x http://127.0.0.1:8080 -k https://example.com/graphql
+```
+
 ### Resumable scans with checkpoints
 
 Large schemas can take a long time to reconstruct. Use `--checkpoint` to save progress after each iteration and resume if interrupted:
@@ -39,9 +71,38 @@ Large schemas can take a long time to reconstruct. Use `--checkpoint` to save pr
 clairvoyance https://example.com/graphql -w wordlist.txt --checkpoint scan.checkpoint -o schema.json
 ```
 
-If the scan is interrupted (Ctrl+C, network failure, etc.), re-run the same command to resume from where it left off. The checkpoint file stores the discovered schema, the set of already-explored types, and the current iteration counter.
+If the scan is interrupted (Ctrl+C, network failure, auth expiry, etc.), re-run the same command to resume from where it left off. The checkpoint file stores the discovered schema, the set of already-explored types, and the current iteration counter.
 
 `--checkpoint` is mutually exclusive with `-i/--input-schema`.
+
+### Progress and logging
+
+```bash
+# Rich progress bar
+clairvoyance --progress https://example.com/graphql
+
+# JSON log output (one JSON object per line, for agent/machine consumption)
+clairvoyance --json-log https://example.com/graphql
+
+# Verbose/debug logging
+clairvoyance -v https://example.com/graphql
+```
+
+### Cookie control
+
+Cookies are persisted across requests by default. Disable this if needed:
+
+```bash
+clairvoyance --no-cookies https://example.com/graphql
+```
+
+### Wordlist validation
+
+Filter wordlist entries against the GraphQL name regex (`[_A-Za-z][_0-9A-Za-z]*`):
+
+```bash
+clairvoyance -w wordlist.txt -wv https://example.com/graphql
+```
 
 ### Which wordlist should I use?
 
@@ -58,6 +119,29 @@ LOG_FMT=`%(asctime)s \t%(levelname)s\t| %(message)s` # A string format for loggi
 LOG_DATEFMT=`%Y-%m-%d %H:%M:%S` # A string format for logging date.
 LOG_LEVEL=`INFO` # A string level for logging.
 ```
+
+## CLI Reference
+
+| Flag | Description |
+|------|-------------|
+| `-w <file>` | Custom wordlist (one word per line) |
+| `-wv` | Validate wordlist against GraphQL name regex |
+| `-o <file>` | Output file for JSON schema |
+| `-i <file>` | Input partial schema to supplement |
+| `-d <string>` | Starting document (default: `query { FUZZ }`) |
+| `-H <header>` | HTTP header (repeatable, format: `Key: Value`) |
+| `-c <int>` | Number of concurrent requests |
+| `-p slow\|fast` | Speed profile (default: `fast`) |
+| `-x <url>` | Proxy URL |
+| `-k` | Disable SSL verification |
+| `-m <int>` | Max retries per request |
+| `-b <int>` | Exponential backoff factor (`0.5 * backoff**retries` seconds) |
+| `--checkpoint <file>` | Checkpoint file for resumable scans |
+| `--progress` | Show rich progress bar |
+| `--rate-limit <float>` | Max requests per second |
+| `--json-log` | Emit one JSON object per log line |
+| `--no-cookies` | Disable cookie jar |
+| `-v` | Verbose/debug logging |
 
 ## Support
 
