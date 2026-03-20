@@ -17,19 +17,28 @@ Clairvoyance helps to obtain GraphQL API schema even if the introspection is dis
 
 ## Getting Started
 
-### pip
+### From source (this fork)
+
+```bash
+git clone https://github.com/yourusername/clairvoyance.git
+cd clairvoyance
+poetry install
+poetry run clairvoyance https://rickandmortyapi.com/graphql -o schema.json
+```
+
+Or run directly without installing:
+
+```bash
+python -m clairvoyance https://rickandmortyapi.com/graphql -o schema.json
+```
+
+### From PyPI (original)
 
 ```bash
 pip install clairvoyance
-clairvoyance https://rickandmortyapi.com/graphql -o schema.json
-# should take about 2 minutes
 ```
 
-### docker
-
-```bash
-docker run --rm nikitastupin/clairvoyance --help
-```
+> **Note:** The PyPI package is the [upstream version](https://github.com/nikitastupin/clairvoyance) and does not include the features added in this fork.
 
 ## Advanced Usage
 
